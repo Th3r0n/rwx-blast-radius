@@ -1,0 +1,11 @@
+kit/
+ref/
+lab/out/
+lab/corpus/
+output*.jsonl
+__pycache__/
+*.pyc
+.claude/
+lab/data/
+lab/notes/
+lab/scratch/

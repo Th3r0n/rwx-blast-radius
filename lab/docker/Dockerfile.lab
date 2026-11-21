@@ -1,0 +1,17 @@
+# Lab image: the labeling environment (pinned base, requirements.lock, sqlglot at
+# the pinned commit) plus git for `git apply`. Never used for submissions.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN dpkg-query -W -f '${Package} ${Version}\n' | sort > /dpkg-before.txt \
+ && python -c "import sqlite3;print(sqlite3.sqlite_version)" > /sqlite-before.txt
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock
+RUN python -c "import io,tarfile,urllib.request;d=urllib.request.urlopen('https://codeload.github.com/tobymao/sqlglot/tar.gz/eb11aec4be8cb2122afe713a4816662c3f0fb2fa',timeout=300).read();tarfile.open(fileobj=io.BytesIO(d)).extractall('/opt',filter='data')" \
+ && mv /opt/sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa /opt/sqlglot
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/* \
+ && dpkg-query -W -f '${Package} ${Version}\n' | sort > /dpkg-after.txt \
+ && python -c "import sqlite3;print(sqlite3.sqlite_version)" > /sqlite-after.txt \
+ && cmp /sqlite-before.txt /sqlite-after.txt \
+ && cd /opt/sqlglot && git init -q && git add -A && git -c user.email=lab@local -c user.name=lab commit -qm pinned
+ENV SKIP_INTEGRATION=0
+WORKDIR /opt/sqlglot
