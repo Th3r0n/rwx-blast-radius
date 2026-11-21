@@ -29,8 +29,8 @@ def _cost(numbers, ms):
 
 
 def _hot_eligible(res, maps):
-    if res.all:
-        return False
+    if res.all or getattr(res, "deleted", False):
+        return False  # the verifier cannot make a pinned file disappear
     for path, change in res.changes:
         loaded = path in maps.preload_mods
         if loaded and (change.import_time or change.kind != "function"):
@@ -328,7 +328,9 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
 
     if "sqlglot" in sys.modules or not os.path.exists(state_path):
         return
-    jobs = [cid for cid, res in statics.items() if res.clean and not getattr(res, "hard", False)]
+    jobs = [
+        cid for cid, res in statics.items() if res.clean and not getattr(res, "hard", False) and not getattr(res, "deleted", False)
+    ]
     if not jobs:
         return
     with open(state_path, "rb") as f:
@@ -418,7 +420,7 @@ def refine_lazy(answers, statics, tests, maps, number_of, unknown, deadline, log
 
     if "sqlglot" in sys.modules or not os.path.exists(state_path):
         return
-    jobs = [cid for cid, res in statics.items() if res.lazy and not res.all]
+    jobs = [cid for cid, res in statics.items() if res.lazy and not res.all and not getattr(res, "deleted", False)]
     if not jobs:
         return
     with open(state_path, "rb") as f:

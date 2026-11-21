@@ -106,7 +106,7 @@ class StaticSelector:
         if fp.is_new:
             return self._created(fp, res)
         if fp.is_deleted:
-            return res.widen(f"deleted file {path}")
+            return self._deleted(fp, res)
         old = self.read_pinned(path)
         if old is None:
             return res.widen(f"modified file missing from the pinned tree {path}")
@@ -128,6 +128,25 @@ class StaticSelector:
             # A file inside the source trees that no traced test opened, e.g.
             # py.typed or a fixture of a skipped suite: still nothing reads it.
             return res.reasons.append(f"unread data file {path}")
+        return None
+
+    def _deleted(self, fp, res: Result):
+        path = fp.old_path
+        res.deleted = True
+        directory = posixpath.dirname(path)
+        listers = self.maps.dir_listers(directory)
+        if path.endswith(".py"):
+            if not path.startswith("sqlglot/") or path in self.maps.preload_mods or path.endswith("__init__.py"):
+                return res.widen(f"deleted module {path}")
+            # A lazily imported module: only tests that imported it (they fail
+            # now), plus anyone who lists its folder.
+            res.add(self.maps.file_tests(path), f"importers of deleted {path}")
+            res.add(listers, f"listers of {directory}")
+            return None
+        if posixpath.basename(path) in PYTEST_CONFIG:
+            return res.widen(f"deleted configuration {path}")
+        res.add(self.maps.readers(path), f"readers of deleted {path}")
+        res.add(listers, f"listers of {directory}")
         return None
 
     def _created(self, fp, res: Result):

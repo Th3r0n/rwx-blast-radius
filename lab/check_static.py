@@ -28,7 +28,7 @@ for s in sets:
         if res.all:
             chosen = set(ms)
         else:
-            chosen = set(); b = res.bits; i = 0
+            chosen = set(); b = res.bits | res.lazy_bits; i = 0
             while b:
                 if b & 1 and bitnum[i] is not None: chosen.add(bitnum[i])
                 b >>= 1; i += 1

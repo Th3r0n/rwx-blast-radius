@@ -86,6 +86,10 @@ def main() -> int:
                 log(cid, "error, running everything:", repr(exc))
                 answers[cid] = every
 
+    # Wall budget for the refining stages: the batch has 3 min for ~40 commits
+    # (4.5 min for ~60 in the final); keep well clear of it. Static answers are
+    # always ready, so running out of budget only costs precision.
+    deadline_s = float(os.environ.get("BR_DEADLINE") or min(165.0, max(100.0, 2.6 * len(commits))))
     if selector is not None and os.environ.get("BR_VERIFY", "1") == "1":
         try:
             from . import policy
@@ -98,7 +102,7 @@ def main() -> int:
                     maps,
                     number_of,
                     unknown,
-                    deadline=started + float(os.environ.get("BR_DEADLINE", "110")),
+                    deadline=started + deadline_s,
                     log=log,
                     maps_dir=maps_dir,
                     state_path=os.environ.get("BR_STATE", os.path.join(os.path.dirname(here), "state.marshal")),
@@ -116,7 +120,7 @@ def main() -> int:
                     ms,
                     maps,
                     number_of,
-                    deadline=started + float(os.environ.get("BR_DEADLINE", "110")),
+                    deadline=started + deadline_s,
                     log=log,
                     maps_dir=maps_dir,
                     state_path=os.environ.get("BR_STATE", os.path.join(os.path.dirname(here), "state.marshal")),
@@ -133,7 +137,7 @@ def main() -> int:
                 ms,
                 maps,
                 number_of,
-                deadline=started + float(os.environ.get("BR_DEADLINE", "110")),
+                deadline=started + deadline_s,
                 log=log,
             )
         except Exception as exc:  # keep the static answers

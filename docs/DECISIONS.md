@@ -57,3 +57,34 @@ noted; no code from any other team is used.
   can do; any other change to them (membership) is still seen.
 - `gc.collect()` runs before every snapshot: dead dynamically created classes
   would otherwise still be listed by `type.__subclasses__`.
+
+## Readers of changed import-time cells
+Measured at the pinned commit (lab/trace attribute pass): every non-callable class
+attribute is wrapped in a recording descriptor and every dict value in a recording
+dict, in a fork of the warm state per test (all 1620 tests still pass). Rules, each
+a superset of who can observe a cell (br/policy.py `cell_readers`):
+- function-valued cell (method, classmethod, staticmethod, property, module
+  function), pinned or patched value: the tests that started the pinned function;
+  a removed or replaced function is observable only by its former callers;
+- new attribute (absent at the pinned commit): every test that read anything
+  through the class or a subclass, plus every code object naming the attribute;
+- dict-valued attribute that stays a dict: readers of the changed keys plus
+  whole-dict readers (iteration, len, copy, unpacking...);
+- other class attribute: reads through the owner or any subclass;
+- module global: every code object naming it (globals, attributes, strings);
+- a changed MRO or anything unrecognised: every test.
+Lazily imported modules are diffed in a child that imports only the patched
+modules and their importers (from the source import graph) and compares only the
+cells those modules own: cells of other modules were built with every module
+loaded in the pinned snapshot, so they are not comparable.
+
+## Deleted files
+A deleted non-Python file selects its readers and the tests that list its folder;
+a deleted lazily imported sqlglot module selects the tests that imported it plus
+the listers; a deleted preloaded module, package `__init__`, test-side file or
+configuration file selects every test. Commits that delete files are never
+verified by running tests (the verifier cannot make a pinned file disappear).
+
+## Wall budget
+Refining stages stop at min(165 s, max(100 s, 2.6 s per commit)); the static
+answer is always ready, so the budget only bounds precision.

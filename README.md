@@ -24,14 +24,25 @@ cheap candidates are run against the patched code in forked children.
    test of the pinned commit with `sys.monitoring` (line and function-start
    events per code object), each in a fresh fork of the post-collection state,
    plus one in-order pass of the whole suite; the union is used.
-4. **Verification** (`br/verify.py`, `br/policy.py`). When it is cheaper than
+4. **Import-time state** (`br/statediff.py`, `br/buildstate.py`). A change that
+   acts at import time is measured, not guessed: a child imports the patched tree
+   (every test module, like pytest's collection, for modules loaded then; only the
+   patched modules and their importers for lazily imported ones) and digests every
+   module global, class attribute and dict key; the image build stored the same
+   digests for the pinned commit. Each changed cell selects its readers, measured
+   per test at the pinned commit with recording descriptors and recording dicts
+   (`maps/attrs.bin`), or, for functions, the tests that ran the pinned function.
+5. **Item slices** (`br/slices.py`). Tests that loop over a fixture file (TPC
+   queries, optimizer fixture pairs) are run on the items the patch can reach only:
+   per-item coverage was recorded at the pinned commit.
+6. **Verification** (`br/verify.py`, `br/policy.py`). When it is cheaper than
    selecting them, candidates are run in a child forked from a warm process that
    imported every test module like pytest's collection. The patch is made live
    by swapping the code objects of the changed functions, serving patched
    sources to modules imported later and patched bytes to file reads. Process
    pools run inline with real pickle round trips. A test is dropped only after
    it passed in a child that proved the patch active.
-5. **Packing** (`br/pack.py`): 1 to 8 workers, longest first plus local search,
+7. **Packing** (`br/pack.py`): 1 to 8 workers, longest first plus local search,
    minimising busiest worker + 2 s per worker, in whole milliseconds.
 
 Any exception, timeout or dead child keeps the tests concerned; a crash of the

@@ -70,6 +70,8 @@ def main(argv=None):
     p.add_argument("--front", default="", help="front.marshal: front mode for test_execute_tpcds only")
     p.add_argument("--no-slice", action="store_true", help="front mode: skip the all-affected-items reference")
     p.add_argument("--patch-dir", default="", help="front mode: extra unlabeled patches (*.patch), set name 'extra'")
+    p.add_argument("--front-full", default="unlabeled", choices=["none", "unlabeled", "all"],
+                   help="front mode: also run the full test (reference) for these rows")
     a = p.parse_args(argv)
     front = slices.load_front(a.front) if a.front else None
     if a.front and front is None:
@@ -145,6 +147,8 @@ def main(argv=None):
                         plan.append((row, "front", job, items))
                         if not a.no_slice:
                             plan.append((row, "slice", job, items))
+                        if a.front_full == "all" or (a.front_full == "unlabeled" and label is None):
+                            plan.append((row, "full", job, None))
                     continue
                 if items:
                     plan.append((row, "slice", job, items))
@@ -336,6 +340,20 @@ def summarize_front(rows):
             s["decided_by_front"] += ran == []
         s["cpu_front_check"] += f.get("front_cpu") or 0.0
         out = f.get("outcome")
+        full = (r.get("full") or {}).get("outcome")
+        if full is not None:
+            s.setdefault("full_ref", {"rows": 0, "front_pass_full_fail": [], "front_fail_full_pass": [],
+                                      "slice_vs_full_differ": [], "cpu_full_child": 0.0})
+            fr = s["full_ref"]
+            fr["rows"] += 1
+            fr["cpu_full_child"] += r["full"]["cpu"]
+            if out == "pass" and full != "pass":
+                fr["front_pass_full_fail"].append((r["set"], r["cid"], full))
+            if out == "fail" and full == "pass":
+                fr["front_fail_full_pass"].append((r["set"], r["cid"]))
+            slo = (r.get("slice") or {}).get("outcome")
+            if slo is not None and slo != full:
+                fr["slice_vs_full_differ"].append((r["set"], r["cid"], slo, full))
         if out not in ("pass", "fail", "skip"):
             s["noverdict"].append((r["set"], r["cid"], out))
         if out == "pass" and r["label"] == "fail":
