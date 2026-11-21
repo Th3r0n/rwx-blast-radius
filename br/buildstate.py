@@ -47,6 +47,47 @@ def import_all_sqlglot(root):
     return failed
 
 
+def import_graph(root):
+    """{module: sorted modules it imports} for every sqlglot module, from the source
+    (module-level and function-level import statements, relative ones resolved)."""
+    import ast
+
+    graph = {}
+    base = os.path.join(root, "sqlglot")
+    for dirpath, _, names in os.walk(base):
+        for name in names:
+            if not name.endswith(".py"):
+                continue
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            mod = rel[:-3].replace("/", ".")
+            is_pkg = mod.endswith(".__init__")
+            if is_pkg:
+                mod = mod[: -len(".__init__")]
+            package = mod if is_pkg else mod.rpartition(".")[0]
+            deps = set()
+            try:
+                tree = ast.parse(open(full, "rb").read())
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        deps.add(alias.name)
+                elif isinstance(node, ast.ImportFrom):
+                    if node.level:
+                        parts = package.split(".")
+                        up = parts[: len(parts) - (node.level - 1)] if node.level > 1 else parts
+                        target = ".".join(up + ([node.module] if node.module else []))
+                    else:
+                        target = node.module or ""
+                    deps.add(target)
+                    for alias in node.names:
+                        deps.add(f"{target}.{alias.name}")  # "from pkg import submodule"
+            graph[mod] = sorted(d for d in deps if d.startswith("sqlglot"))
+    return graph
+
+
 def child(out, root, maps_dir, unordered_path=None, full=False):
     from . import statediff, unitrun
 
@@ -73,6 +114,7 @@ def child(out, root, maps_dir, unordered_path=None, full=False):
 def parent(out, root, maps_dir):
     warm = _combined(out, root, maps_dir, full=False)
     full = _combined(out, root, maps_dir, full=True)
+    full["graph"] = import_graph(root)
     warm["full"] = full
     with open(out, "wb") as f:
         marshal.dump(warm, f)

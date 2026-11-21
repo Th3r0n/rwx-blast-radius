@@ -743,6 +743,12 @@ class Generator:
         )
 
     # -- helpers
+    def front_lines(self) -> set:
+        if not hasattr(self, "_front_lines"):
+            path = Path(os.environ.get("FRONT_LINES", str(Path(__file__).resolve().parent / "scratch" / "front_lines.json")))
+            self._front_lines = {tuple(x) for x in json.loads(path.read_text())}
+        return self._front_lines
+
     def src(self, rel: str) -> Source:
         if rel not in self.sources:
             self.sources[rel] = Source(rel, (PRISTINE / rel).read_bytes().decode("utf-8"))
@@ -955,6 +961,23 @@ class Generator:
         if style == "t_typing":
             files = [f for f in py if f.startswith("sqlglot/typing/")]
             return "code", [self.code_part(files)], {"lot": "typing"}
+        if style == "t_front":
+            # Code sites on lines only the front phase of test_execute_tpcds runs
+            # (lab/scratch/front_lines.json: cov minus rest of maps/slices.marshal).
+            lines = self.front_lines()
+
+            import bisect
+
+            starts = {}
+
+            def in_front(rel, site):
+                if rel not in starts:
+                    text = self.src(rel).text
+                    starts[rel] = [0] + [i + 1 for i, c in enumerate(text) if c == chr(10)]
+                return (rel, bisect.bisect_right(starts[rel], site[1][0][0][0])) in lines
+
+            files = sorted({r for r, _ in lines} & set(py))
+            return "code", [self.code_part(files, line_filter=in_front)], {"lot": "front"}
         if style == "t_serde":
             return "code", [self.code_part(["sqlglot/serde.py"])], {"lot": "serde"}
         if style == "t_semicolon":
@@ -1313,6 +1336,7 @@ MIXES = {
             "o_func_rename_callers": 5, "o_import_add": 8, "o_new_file": 8, "o_delete_file": 8,
             "o_tests_edit": 15, "o_sqlglotc": 5, "o_docs": 8, "o_init": 7},
     "state": {"s_lazy": 60, "s_collected": 40},
+    "front": {"t_front": 1},
 }
 
 

@@ -68,6 +68,8 @@ def main(argv=None):
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--dry", action="store_true")
     p.add_argument("--front", default="", help="front.marshal: front mode for test_execute_tpcds only")
+    p.add_argument("--no-slice", action="store_true", help="front mode: skip the all-affected-items reference")
+    p.add_argument("--patch-dir", default="", help="front mode: extra unlabeled patches (*.patch), set name 'extra'")
     a = p.parse_args(argv)
     front = slices.load_front(a.front) if a.front else None
     if a.front and front is None:
@@ -90,8 +92,10 @@ def main(argv=None):
     rows = []
     stats = {"patches": 0, "all": 0, "no_sliceable_candidate": 0, "not_hot": 0, "pairs": 0}
     t0 = time.perf_counter()
-    for set_name in a.sets.split(","):
-        pdir = os.path.join(_REPO, "lab", "corpus", set_name, "patches")
+    sources = [(s, os.path.join(_REPO, "lab", "corpus", s, "patches")) for s in a.sets.split(",") if s]
+    if a.patch_dir:
+        sources.append(("extra", a.patch_dir))
+    for set_name, pdir in sources:
         for path in sorted(glob.glob(os.path.join(pdir, "*.patch"))):
             cid = os.path.basename(path)[: -len(".patch")]
             if a.limit and stats["patches"] >= a.limit:
@@ -139,6 +143,8 @@ def main(argv=None):
                 if front is not None:
                     if items:
                         plan.append((row, "front", job, items))
+                        if not a.no_slice:
+                            plan.append((row, "slice", job, items))
                     continue
                 if items:
                     plan.append((row, "slice", job, items))
@@ -176,13 +182,19 @@ def main(argv=None):
             slices.duckdb_single_thread()
             c0 = time.process_time()
             if kind == "front":
-                to_run = slices.plan_in_child(row["test"], items, row.get("rest_items"), front, smap)
+                rep = {}
+                to_run = slices.plan_in_child(row["test"], items, row.get("rest_items"), front, smap, report=rep)
                 out["ran_items"] = to_run
-                out["front_cpu"] = time.process_time() - c0
+                out["report"] = rep
+                out["front_cpu"] = rep.get("front_cpu", 0.0)
                 if not to_run:
                     out.update(outcome="pass", detail=None, test_cpu=0.0, run_cpu=time.process_time() - c0)
                     dump(out)
                     return
+            elif kind == "dropcheck":
+                # The items the front proof dropped, run alone with the patch active and
+                # without any front recomputation first: each must pass.
+                slices.install_filter(row["test"], items, smap)
             elif items is not None:
                 slices.install_filter(row["test"], items, smap)
             v = unitrun.run_tests([by_id[row["test"]]], root=ROOT, warm=warm.state)[0]
@@ -212,11 +224,26 @@ def main(argv=None):
         row[kind] = out
         if kind in ("slice", "front") and out.get("outcome") == "pass" and (row["label"] == "fail"):
             log(f"DISAGREEMENT {row['cid']} {row['test']} items={row['items']}")
+        if kind == "dropcheck" and out.get("outcome") != "pass":
+            log(f"DROPCHECK {out.get('outcome')} {row['cid']} dropped={items} {str(out.get('detail'))[:300]}")
 
     order = sorted(plan, key=lambda w: -smap.get(w[0]["test"]).seconds)
     wall = pool.run(order, body_of, on_done, lambda w: w[2].wall_limit)
+    if front is not None:
+        # Phase 2: the dropped items of every front job, in fresh children.
+        drop = []
+        for row, kind, job, items in plan:
+            if kind != "front":
+                continue
+            eq = ((row.get("front") or {}).get("report") or {}).get("equal") or []
+            if eq:
+                drop.append((row, "dropcheck", job, eq))
+        log(f"dropcheck: {len(drop)} jobs")
+        wall += pool.run(drop, body_of, on_done, lambda w: w[2].wall_limit)
     write_json(os.path.join(a.out, "rows.json"), rows)
     summary = summarize(rows, stats)
+    if front is not None:
+        summary["front"] = summarize_front(rows)
     summary["wall"] = wall
     write_json(os.path.join(a.out, "summary.json"), summary)
     log(json.dumps(summary, indent=1)[:4000])
@@ -273,6 +300,62 @@ def summarize(rows, stats):
         "full_fail_label_pass": sum(1 for r in rows if (r["full"] or {}).get("outcome") == "fail" and r["label"] == "pass"),
         "full_pass_label_fail": sum(1 for r in rows if (r["full"] or {}).get("outcome") == "pass" and r["label"] == "fail"),
     }
+    return s
+
+
+def summarize_front(rows):
+    """test_execute_tpcds front-proof numbers (rows of a --front run)."""
+    s = {"pairs": 0, "sliced": 0, "zero_items": 0, "front_jobs": 0, "decided_by_front": 0,
+         "items_total": 0, "items_affected": 0, "candidates": 0, "equal": 0, "items_run": 0,
+         "cpu_front_check": 0.0, "cpu_front_child": 0.0, "cpu_slice_child": 0.0, "cpu_pairs": 0,
+         "label_fail": 0, "unsound_verdict": [], "unsound_drop": [], "noverdict": [],
+         "front_fail_label_pass": [], "front_vs_slice": {"same": 0, "front_pass_slice_fail": [], "front_fail_slice_pass": []}}
+    for r in rows:
+        s["pairs"] += 1
+        if r["items"] is None:
+            continue
+        s["sliced"] += 1
+        s["items_total"] += r["total"]
+        s["items_affected"] += len(r["items"])
+        if r["items"] == []:
+            s["zero_items"] += 1
+            if r["label"] == "fail":
+                s["unsound_verdict"].append((r["set"], r["cid"], "zero items"))
+            continue
+        f = r.get("front")
+        if not f:
+            continue
+        s["front_jobs"] += 1
+        s["label_fail"] += r["label"] == "fail"
+        rep = f.get("report") or {}
+        s["candidates"] += len(rep.get("candidates") or [])
+        s["equal"] += len(rep.get("equal") or [])
+        ran = f.get("ran_items")
+        if ran is not None:
+            s["items_run"] += len(ran)
+            s["decided_by_front"] += ran == []
+        s["cpu_front_check"] += f.get("front_cpu") or 0.0
+        out = f.get("outcome")
+        if out not in ("pass", "fail", "skip"):
+            s["noverdict"].append((r["set"], r["cid"], out))
+        if out == "pass" and r["label"] == "fail":
+            s["unsound_verdict"].append((r["set"], r["cid"], "front pass, label fail"))
+        if out == "fail" and r["label"] == "pass":
+            s["front_fail_label_pass"].append((r["set"], r["cid"]))
+        d = r.get("dropcheck")
+        if d is not None and d.get("outcome") != "pass":
+            s["unsound_drop"].append((r["set"], r["cid"], d.get("outcome"), (d.get("detail") or "")[:300]))
+        sl = r.get("slice")
+        if sl:
+            s["cpu_front_child"] += f["cpu"]
+            s["cpu_slice_child"] += sl["cpu"]
+            s["cpu_pairs"] += 1
+            if sl.get("outcome") == out:
+                s["front_vs_slice"]["same"] += 1
+            elif out == "pass":
+                s["front_vs_slice"]["front_pass_slice_fail"].append((r["set"], r["cid"], sl.get("outcome")))
+            else:
+                s["front_vs_slice"]["front_fail_slice_pass"].append((r["set"], r["cid"], out, sl.get("outcome")))
     return s
 
 

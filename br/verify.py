@@ -625,6 +625,29 @@ def run_lazy_diff(job: Job, pristine_full: dict):
     return info
 
 
+def _family(patched, graph):
+    """Patched modules plus every sqlglot module that imports one of them, transitively."""
+    if not graph:
+        return None
+    importers: dict = {}
+    for mod, deps in graph.items():
+        for dep in deps:
+            importers.setdefault(dep, set()).add(mod)
+    out = set()
+    stack = list(patched)
+    while stack:
+        mod = stack.pop()
+        if mod in out:
+            continue
+        if mod.endswith("__main__"):
+            continue  # the CLI entry point is never imported by tests
+        out.add(mod)
+        stack.extend(importers.get(mod, ()))
+        # "import sqlglot.a.b" also makes sqlglot.a an importer of sorts: packages
+        # re-export submodules; include parent packages that import the module.
+    return out
+
+
 def _lazy_child(job, pristine_full, w):
     from . import buildstate, statediff
     from .policy import _subclass_ids
@@ -641,24 +664,41 @@ def _lazy_child(job, pristine_full, w):
     sys.meta_path.insert(0, finder)
     _install_redirects(redirect)
     os.chdir(ROOT)
-    failed = buildstate.import_all_sqlglot(ROOT)
+    family = _family([m for m in modules if m.startswith("sqlglot")], pristine_full.get("graph"))
+    if family is None:
+        failed = buildstate.import_all_sqlglot(ROOT)
+    else:
+        import importlib
+
+        sys.path.insert(0, ROOT) if ROOT not in sys.path else None
+        import sqlglot  # noqa: F401
+
+        failed = []
+        for name in sorted(family):
+            try:
+                importlib.import_module(name)
+            except Exception:
+                failed.append(name)
     for name in modules:
         if name.startswith("sqlglot") and name in sys.modules and name not in finder.served:
             raise RuntimeError(f"{name} was imported without the patch")
     if failed:
         raise RuntimeError(f"patched modules fail to import: {failed[:5]}")
     gc.collect()
-    snap = statediff.snapshot(
-        [m for m in sys.modules if m.startswith("sqlglot")],
-        prefix=("sqlglot",),
-        unordered=frozenset(map(tuple, pristine_full["unstable"])),
-    )
+    names = [m for m in sys.modules if m.startswith("sqlglot")]
+    if family is not None:
+        names = [m for m in names if m in family]
+    snap = statediff.snapshot(names, prefix=("sqlglot",), unordered=frozenset(map(tuple, pristine_full["unstable"])))
+    pinned = pristine_full["cells"]
+    if family is not None:
+        # Only cells owned by the family are comparable: everything else was
+        # built with other modules loaded (registries) in the pinned snapshot.
+        snap = {c: d for c, d in snap.items() if statediff.cell_module(c) in family}
+        pinned = {c: d for c, d in pinned.items() if statediff.cell_module(c) in family}
     touched = sorted(finder.served)
     chaotic = set(map(tuple, pristine_full["chaotic"]))
     cells = [
-        c
-        for c in statediff.diff(pristine_full["cells"], snap, touched)
-        if c not in chaotic or statediff.cell_module(c) in touched
+        c for c in statediff.diff(pinned, snap, touched) if c not in chaotic or statediff.cell_module(c) in touched
     ]
     funcs = _function_cells(cells, job)
     dicts_now = set()

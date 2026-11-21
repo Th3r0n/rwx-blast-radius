@@ -26,8 +26,14 @@ lab/build_slices.py stored the result in maps/slices.marshal:
               outside any single item (class setup, loop scaffolding, or only when
               several items run in sequence) - touching it affects every item.
     rest      same layout for test_execute_tpcds only: coverage outside the "front"
-              phase (parse_one + pickling in the main process, executor.optimize in the
-              worker), see front_equal(); None otherwise.
+              phase (parse_one + the call-item pickle round trip, executor.optimize),
+              see the front proof below; None otherwise.
+
+maps/front.marshal (build_front; `python -m br.slices --build-front OUT ROOT MAPS`):
+  {"version": FRONT_VERSION, "test": TPCDS_TEST, "n": 99, "digests": [bytes | None],
+   "cpu": [per-item CPU of the front recomputation], "unstable": [...], "failed": [...]}
+  digests of the pristine front of every item, built in a warm state under two hash
+  seeds (an item whose digests differ is None, never equal).
 
 Soundness model: a patch whose changed code objects/lines are not in T's common
 coverage reaches item i only if item i ran a changed line (or started a code object
@@ -38,12 +44,39 @@ accepted gap: patched code run by an affected item that leaves different shared 
 behind (a cache entry, a mutated module global) read by an unaffected item later in the
 full run. Everything not understood returns None (= run the whole test).
 
-Runtime use (all stdlib):
-    smap = SliceMap(path)                       # or load_default()
-    items = affected(smap, test_id, res.changes, res.data_changes)
-    None -> run T normally; [] -> T passes without running (if T is a candidate only
-    because of the patch); else, in the verification child, before run_tests():
-    install_filter(test_id, items, smap) and run T normally: it sees only those items.
+Runtime integration (all stdlib). Never slice when the static stage widened to ALL,
+when the patch creates/deletes/renames files, or when the patch is not hot-swappable.
+
+(a) Item-sliced test T (any test in the map):
+    parent:  smap = load_default()
+             items = affected(smap, T, res.changes, res.data_changes)
+               None -> T is not sliceable for this patch (run it whole or keep it)
+               []   -> no item and no shared code reaches the patch: T passes unrun
+               else -> cost estimate_cpu(smap, T, items); job.slices[T] = items
+    child (verify._child, in this order):
+             1. proof = verify._activate(warm, job)            patch live
+             2. inlinepool.install(<loaded tests.* modules>)   pickling pool stand-in
+             3. duckdb_single_thread()
+             4. install_filter(T, items, smap)                 raises -> no proof
+             5. write the proof, then unitrun.run_tests(job.tests): T sees only items
+
+(b) test_execute_tpcds with the front proof (TPCDS_TEST):
+    parent:  items, rest = affected_split(smap, TPCDS_TEST, res.changes, res.data_changes)
+               items None / [] -> as in (a)
+               else -> cost: check, worst = estimate_front_cpu(smap, items, rest)
+                       (expected about check + estimate_cpu(smap, T, rest) if rest);
+                       job.front[TPCDS_TEST] = (items, rest)
+             front = load_front()      (maps/front.marshal; None -> use (a) instead)
+    child:   1-3 as in (a), then, before any test runs:
+             4. to_run = plan_in_child(TPCDS_TEST, items, rest, front, smap)
+                  recomputes the patched front of the candidates (items - rest),
+                  drops those whose digest equals the pristine one, and installs the
+                  filter for the rest (raises -> treat T as unverified, keep it)
+             5. write the proof; if to_run == []: report T "pass" and remove it from
+                job.tests; else run job.tests (T sees only to_run).
+    plan_in_child must run after _activate (it must see the patched code) and before
+    run_tests (setUpClass state and other tests' side effects are not wanted in it).
+    The child's CPU limit must allow the check (front cpu of the candidates, <= ~4 s).
 """
 
 from __future__ import annotations
@@ -66,6 +99,9 @@ __all__ = [
     "uninstall_filters",
     "duckdb_single_thread",
     "estimate_cpu",
+    "estimate_front_cpu",
+    "fingerprint",
+    "FrontMismatch",
     "front_equal",
     "front_digests",
     "load_front",
@@ -447,103 +483,52 @@ def duckdb_single_thread():
 
 
 # ---------------------------------------------------------------------------
-# test_execute_tpcds: recompute the front phase
+# test_execute_tpcds: the front proof
 #
 # For item i (pair (meta, sql, _) of tpc-ds.sql) the test does, in this process (the
-# inline pool runs the worker in-process):
-#   main:   expr = parse_one(sql); payload = pickle((mp_execute, (expr, meta), {}))
-#   worker: expr2, meta2 = unpickle(payload); mp_execute(expr2, meta2):
-#           not meta2["execute"] -> None (nothing else happens for the item)
-#           else find_tables(expr2) ..., execute(expr2, schema=_schema, tables=...):
-#             ensure_tables(...), schema = ensure_schema(_schema, dialect=None),
-#             optimize(expr2, schema, leave_tables_isolated=True, dialect=None)  <- front
-#             Plan(...), PythonExecutor(...).execute(...), comparison with duckdb   <- rest
-# The front phase (traced separately) is parse_one + the call-item pickling + optimize.
-# If the patch does not touch item i's rest coverage, the rest runs exactly the pristine
-# code; its inputs from the front are expr2 (find_tables) and optimize's result. When
-# both are structurally identical to the pristine ones (and for non-execute items: the
-# front raises nothing), the item behaves as at the pinned commit: it passes.
+# inline pool runs the worker in-process; tests/test_executor.py at the pinned commit):
+#   main:   expr = parse_one(sql); payload = dumps((mp_execute, (expr, meta), {}))
+#   worker: fn, (expr2, meta2), kw = loads(payload); mp_execute(expr2, meta2):
+#           not meta2.get("execute") -> return None (the main then skips the item)
+#           tables = {t.name: _tables[t.name] for t in find_tables(expr2)}
+#           execute(expr2, schema=_schema, tables=tables):          (sqlglot/executor)
+#             tables_ = ensure_tables(tables, dialect=None)
+#             schema = ensure_schema(_schema, dialect=None)          (_schema is truthy)
+#             tables_.supported_table_args != schema.supported_table_args -> ExecuteError
+#             expression = optimize(expr2, schema, leave_tables_isolated=True,
+#                                   dialect=None)                       <- front
+#             expression.sql(pretty=True)        (logger.debug argument, always evaluated)
+#             Plan(expression)                   (starts with expression.copy())
+#             PythonExecutor(tables=tables_).execute(plan); result pickled back;
+#   main:   subtestHelper: transpile(sql, write="duckdb") + duckdb + assert_frame_equal
+# The traced front phase (lab/trace/slices_trace.py install_phases) is parse_one, the
+# call-item dumps/loads and optimize; everything else is the "rest" (entry["rest"]).
+#
+# Claim: if the patch does not reach item i's rest coverage, the rest of item i runs
+# pristine code, and its only inputs from the front are (a) expr2 (read by find_tables
+# before optimize, which copies its input) and (b) the optimized tree (read by .sql()
+# and by Plan through .copy(): node classes, args with every non-Expr value, parent /
+# arg_key / index, comments, _type, _meta, cached _hash values, any instance
+# __dict__). front_digests() recomputes exactly that sequence (find_tables, ensure_tables
+# on stand-in Tables with the real column names, ensure_schema, the table-args check,
+# optimize) with the patch active and digests (a) and (b) with fingerprint(); equal to
+# the pristine digest => item i behaves as at the pinned commit, where it passes. A
+# raising front never compares equal (the real item would fail). For items with
+# execute = false only parse_one + the pickle round trip matter: they must not raise.
+#
+# Accepted gaps (same class as item slicing): module/class state that patched front code
+# leaves behind and pristine rest code (of this or a later item) reads - a lazily built
+# cache, a mutated global, the shared _schema dict; and the inline pool vs. a spawned
+# worker (validated on the suite).
 
 TPCDS_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_FIXTURE = "optimizer/tpc-ds/tpc-ds.sql"
-FRONT_VERSION = 1
+FRONT_VERSION = 2
+FRONT_PATH = os.path.join(os.path.dirname(DEFAULT_PATH), "front.marshal")
 
 
-class _Fingerprint:
-    """sha256 over a canonical pre-order walk (own walker: sqlglot's serde may be patched)."""
-
-    def __init__(self, expr_cls):
-        import hashlib
-
-        self.h = hashlib.sha256()
-        self.expr_cls = expr_cls
-
-    def emit(self, tok):
-        self.h.update(repr(tok).encode("utf-8", "backslashreplace"))
-        self.h.update(b"\x00")
-
-    def walk(self, root):
-        expr_cls = self.expr_cls
-        emit = self.emit
-        seen = {}
-        if isinstance(root, expr_cls):
-            emit(("R", root.parent is None, root.arg_key, root.index))
-        stack = [(root, None, None, None)]
-        while stack:
-            v, parent, key, index = stack.pop()
-            if isinstance(v, expr_cls):
-                vid = id(v)
-                if vid in seen:
-                    emit(("ref", seen[vid]))
-                    continue
-                seen[vid] = len(seen)
-                cls = type(v)
-                if parent is not None:
-                    emit(("P", v.parent is parent, v.arg_key == key, v.index == index))
-                args = v.args
-                emit(("N", cls.__module__, cls.__qualname__, len(args), v._hash is not None))
-                tail = [("comments", v.comments), ("type", v._type), ("meta", v._meta)]
-                todo = []
-                for k, val in args.items():
-                    todo.append(("K", k, val))
-                # Push in reverse so that the walk is pre-order, args first.
-                for name, val in reversed(tail):
-                    stack.append((val, None, None, None))
-                    stack.append((_Token(("A", name)), None, None, None))
-                for _tag, k, val in reversed(todo):
-                    if type(val) is list:
-                        for j in range(len(val) - 1, -1, -1):
-                            stack.append((val[j], v, k, j))
-                        stack.append((_Token(("L", len(val))), None, None, None))
-                    else:
-                        stack.append((val, v, k, None))
-                    stack.append((_Token(("K", k)), None, None, None))
-                continue
-            t = type(v)
-            if t is _Token:
-                emit(v.tok)
-            elif v is None or t in (str, int, float, bool, bytes, complex):
-                emit((t.__name__, repr(v)))
-            elif t is list or t is tuple:
-                emit((t.__name__, len(v)))
-                for j in range(len(v) - 1, -1, -1):
-                    stack.append((v[j], None, None, None))
-            elif t is dict:
-                emit(("dict", len(v)))
-                for k2, val in reversed(list(v.items())):
-                    stack.append((val, None, None, None))
-                    stack.append((k2, None, None, None))
-            elif t is set or t is frozenset:
-                emit((t.__name__, tuple(sorted(_flat_repr(x, expr_cls) for x in v))))
-            else:
-                import enum
-
-                if isinstance(v, enum.Enum):
-                    emit(("enum", t.__module__, t.__qualname__, v.name))
-                else:
-                    r = repr(v)
-                    emit(("obj", t.__module__, t.__qualname__, r if " at 0x" not in r else "<object>"))
-        return self.h.digest()
+class FrontMismatch(Exception):
+    """The front output cannot be compared faithfully: never equal."""
 
 
 class _Token:
@@ -553,17 +538,185 @@ class _Token:
         self.tok = tok
 
 
-def _flat_repr(x, expr_cls):
-    if isinstance(x, expr_cls):
-        return "expr:" + _Fingerprint(expr_cls).walk(x).hex()
-    return f"{type(x).__name__}:{x!r}"
+class _Hashed:
+    """Stands for a child expression inside a hash() tuple, with a known hash."""
+
+    __slots__ = ("h",)
+
+    def __init__(self, h):
+        self.h = h
+
+    def __hash__(self):
+        return self.h
+
+
+def _node_hash(n, memo, expr_cls):
+    """Expression.__hash__ of one node at the pinned commit (children from memo)."""
+    h = hash(n.key)
+    args = n.args
+    if n._hash_raw_args:
+        for k in sorted(args):
+            v = args[k]
+            if v:
+                if type(v) is list:
+                    v = tuple(_Hashed(memo[id(x)]) if isinstance(x, expr_cls) else x for x in v)
+                elif isinstance(v, expr_cls):
+                    v = _Hashed(memo[id(v)])
+                h = hash((h, k, v))
+        return h
+    for k in sorted(args):
+        v = args[k]
+        vt = type(v)
+        if vt is list:
+            for x in v:
+                if x is not None and x is not False:
+                    if type(x) is str:
+                        x = x.lower()
+                    elif isinstance(x, expr_cls):
+                        x = _Hashed(memo[id(x)])
+                    h = hash((h, k, x))
+                else:
+                    h = hash((h, k))
+        elif v is not None and v is not False:
+            if vt is str:
+                v = v.lower()
+            elif isinstance(v, expr_cls):
+                v = _Hashed(memo[id(v)])
+            h = hash((h, k, v))
+    return h
+
+
+def _replica_hash(node, memo, expr_cls):
+    """What the pinned Expression.__hash__ returns for node (iterative post-order).
+
+    Own copy of the algorithm: the patch may change sqlglot's. Raises FrontMismatch on
+    a cycle (the pinned code would not terminate).
+    """
+    got = memo.get(id(node))
+    if got is not None:
+        return got
+    visiting = set()
+    stack = [(node, False)]
+    while stack:
+        n, expanded = stack.pop()
+        nid = id(n)
+        if expanded:
+            memo[nid] = _node_hash(n, memo, expr_cls)
+            visiting.discard(nid)
+            continue
+        if nid in memo:
+            continue
+        if nid in visiting:
+            raise FrontMismatch("cycle in an expression tree")
+        visiting.add(nid)
+        stack.append((n, True))
+        for v in n.args.values():
+            if isinstance(v, expr_cls):
+                if id(v) not in memo:
+                    stack.append((v, False))
+            elif type(v) is list:
+                for x in v:
+                    if isinstance(x, expr_cls) and id(x) not in memo:
+                        stack.append((x, False))
+    return memo[id(node)]
+
+
+_SCALARS = (type(None), str, int, bool, float, bytes)
+
+
+def _tokens(root, expr_cls):
+    """Canonical pre-order token list of everything reachable from root.
+
+    Per expression node: class, arg_key, index, whether _hash is cached, the parent (as
+    the ordinal of a node of this walk), then every args entry in insertion order,
+    comments, _type, _meta and any instance __dict__, recursively; a node met again is
+    a back reference. Values other than expressions, None/str/int/bool/float/bytes,
+    list/tuple/dict and enum members raise FrontMismatch, and so does a parent outside
+    the walk or a cached _hash that the pinned __hash__ would not compute.
+    """
+    import enum
+
+    toks = []
+    append = toks.append
+    index = {}
+    nodes = []
+    fix = []
+    stack = [root]
+    pop = stack.pop
+    while stack:
+        v = pop()
+        t = type(v)
+        if t is _Token:
+            append(v.tok)
+            continue
+        if t in _SCALARS:
+            append((t.__name__, v))
+            continue
+        if isinstance(v, expr_cls):
+            j = index.get(id(v))
+            if j is not None:
+                append(("ref", j))
+                continue
+            index[id(v)] = len(nodes)
+            nodes.append(v)
+            append(("N", t.__module__, t.__qualname__, v.arg_key, v.index, v._hash is not None))
+            fix.append((len(toks), v.parent))
+            append(None)
+            push = []
+            for k, val in v.args.items():
+                push.append(_Token(("K", k)))
+                push.append(val)
+            push.append(_Token(("C",)))
+            push.append(v.comments)
+            push.append(_Token(("T",)))
+            push.append(v._type)
+            push.append(_Token(("M",)))
+            push.append(v._meta)
+            extra = getattr(v, "__dict__", None)
+            if extra:
+                push.append(_Token(("D",)))
+                push.append(dict(sorted(extra.items())))
+            push.reverse()
+            stack.extend(push)
+            continue
+        if t is list or t is tuple:
+            append((t.__name__, len(v)))
+            stack.extend(reversed(v))
+        elif t is dict:
+            append(("dict", len(v)))
+            for k2, val in reversed(list(v.items())):
+                stack.append(val)
+                stack.append(k2)
+        elif isinstance(v, enum.Enum):
+            append(("enum", t.__module__, t.__qualname__, v.name))
+        else:
+            raise FrontMismatch(f"cannot fingerprint a {t.__module__}.{t.__qualname__}")
+    for pos, parent in fix:
+        if parent is None:
+            toks[pos] = ("P",)
+        else:
+            j = index.get(id(parent))
+            if j is None:
+                raise FrontMismatch("parent outside the tree")
+            toks[pos] = ("P", j)
+    memo = {}
+    for n in nodes:
+        if n._hash is not None and n._hash != _replica_hash(n, memo, expr_cls):
+            raise FrontMismatch("cached _hash differs from the pinned __hash__")
+    return toks
 
 
 def fingerprint(expr):
-    """Structural digest of an expression tree (bytes)."""
+    """Structural digest (sha256 bytes) of an expression tree; raises FrontMismatch.
+
+    Independent of PYTHONHASHSEED and of object addresses (see _tokens).
+    """
+    import hashlib
+
     from sqlglot.expressions import Expr
 
-    return _Fingerprint(Expr).walk(expr)
+    toks = _tokens(expr, Expr)
+    return hashlib.sha256("\x00".join(map(repr, toks)).encode("utf-8", "backslashreplace")).digest()
 
 
 def _front_env():
@@ -577,117 +730,168 @@ def _front_env():
     return helpers, te, ex, inlinepool
 
 
-def front_digests(items=None, pairs=None):
-    """{item: digest} of the front phase of test_execute_tpcds, computed in this process.
-
-    digest = sha256 over (meta, sql) + ("noexec") for non-execute items, or
-    + fingerprint(unpickled parse_one result) + fingerprint(optimize result); an
-    exception gives ("error", exception type). Uses the functions the test reaches,
-    so in a verification child with the patch active this is the patched front.
-    """
+def _front_item(env, schema, meta, sql):
+    """Digest of one item's front phase (raises when the real item would raise)."""
     import hashlib
 
-    helpers, te, ex, inlinepool = _front_env()
+    helpers, te, ex, inlinepool = env
+    h = hashlib.sha256()
+    h.update(repr((FRONT_VERSION, sorted(meta.items()), sql)).encode("utf-8", "backslashreplace"))
+    expr = te.parse_one(sql)
+    payload = inlinepool._dumps((te.mp_execute, (expr, meta), {}))
+    fn2, args2, kwargs2 = inlinepool._loads(payload)
+    if fn2 is not te.mp_execute or kwargs2 or len(args2) != 2:
+        raise FrontMismatch("call item did not round-trip")
+    expr2, meta2 = args2
+    if not meta2.get("execute"):
+        h.update(b"noexec")
+        return h.digest()
+    h.update(b"in")
+    h.update(fingerprint(expr2))  # as find_tables sees it (optimize copies its input)
+    tables = {}
+    for t in te.find_tables(expr2):
+        name = t.name
+        if name not in schema:  # _tables has exactly the TPCDS_SCHEMA tables
+            raise KeyError(name)
+        tables[name] = ex.Table(columns=schema[name])  # ensure_tables reads no rows
+    tables_ = ex.ensure_tables(tables, dialect=None)
+    if not schema:
+        raise FrontMismatch("empty schema")  # execute() would infer one from the rows
+    schema_obj = ex.ensure_schema(schema, dialect=None)
+    if tables_.supported_table_args and tables_.supported_table_args != schema_obj.supported_table_args:
+        raise FrontMismatch("table args differ (ExecuteError)")
+    optimized = ex.optimize(expr2, schema_obj, leave_tables_isolated=True, dialect=None)
+    h.update(b"opt")
+    h.update(fingerprint(optimized))
+    return h.digest()
+
+
+def front_digests(items=None, pairs=None, cpu=None):
+    """{item: digest or None} of test_execute_tpcds' front phase, computed here.
+
+    Uses the functions the test reaches, so in a verification child with the patch
+    active this is the patched front. None = the recomputation raised (the real item
+    would fail or could not be compared). cpu: optional dict filled with per-item CPU
+    seconds.
+    """
+    import time
+
+    env = _front_env()
+    helpers, te, ex, inlinepool = env
     if pairs is None:
         pairs = list(helpers.load_sql_fixture_pairs(TPCDS_FIXTURE))
     if items is None:
         items = range(len(pairs))
-    # The worker's _schema: the initializer's arguments after a pickle round trip.
+    # The worker's _schema: the initializer's arguments after a pickle round trip,
+    # one object shared by all items (as in the worker).
     schema = inlinepool._loads(inlinepool._dumps(helpers.TPCDS_SCHEMA))
     out = {}
     for i in items:
         meta, sql, _expected = pairs[i]
-        h = hashlib.sha256()
-        h.update(repr((FRONT_VERSION, sorted(meta.items()), sql)).encode("utf-8", "backslashreplace"))
+        c0 = time.process_time()
         try:
-            expr = te.parse_one(sql)
-            payload = inlinepool._dumps((te.mp_execute, (expr, meta), {}))
-            _fn, (expr2, meta2), _kw = inlinepool._loads(payload)
-            if not meta2.get("execute"):
-                h.update(b"noexec")
-            else:
-                h.update(fingerprint(expr2))
-                for _t in te.find_tables(expr2):  # mp_execute walks the tables first
-                    _t.name
-                schema_obj = ex.ensure_schema(schema, dialect=None)
-                optimized = ex.optimize(expr2, schema_obj, leave_tables_isolated=True, dialect=None)
-                h.update(b"opt")
-                h.update(fingerprint(optimized))
-        except Exception as exc:  # the real test would fail (or differ): never equal
-            h.update(repr(("error", type(exc).__qualname__)).encode())
+            out[i] = _front_item(env, schema, meta, sql)
+        except Exception:  # the real test would fail (or differ): never equal
             out[i] = None
-            continue
-        out[i] = h.digest()
+        if cpu is not None:
+            cpu[i] = time.process_time() - c0
     return out
 
 
 def load_front(path=None):
-    """Pristine front digests written by --build-front, or None."""
+    """Pristine front digests (build_front / --build-front), or None."""
     if path is None:
-        path = os.environ.get("BR_FRONT") or os.path.join(os.path.dirname(DEFAULT_PATH), "front.marshal")
+        path = os.environ.get("BR_FRONT") or FRONT_PATH
     try:
         with open(path, "rb") as f:
             data = marshal.load(f)
     except (OSError, ValueError, EOFError, TypeError):
         return None
-    if data.get("version") != FRONT_VERSION or data.get("test") != TPCDS_TEST:
+    if type(data) is not dict or data.get("version") != FRONT_VERSION or data.get("test") != TPCDS_TEST:
+        return None
+    if len(data.get("digests") or ()) != data.get("n"):
         return None
     return data
 
 
-def front_equal(items, pristine, fixture_changed=False):
-    """(equal, differing): items of test_execute_tpcds whose front output matches pristine.
+def front_equal(items, pristine):
+    """(equal, differing) among items of test_execute_tpcds: front output == pristine?
 
     Call inside the verification child with the patch active, before the test runs.
     `pristine` is load_front(). Items without a stable pristine digest, or whose
-    recomputation raises, are differing. An equal item still needs its rest
-    coverage untouched (affected_split) to be skipped. With fixture_changed the
-    fixture's (meta, sql) are part of the digest, so changed entries differ unless
-    only the unused expected text changed.
+    recomputation raises, are differing; so is everything when the fixture no longer
+    has the recorded number of entries. An equal item still needs its rest coverage
+    untouched (affected_split()[1]) to be skipped: plan_in_child() does both.
     """
     items = sorted(set(items))
-    if pristine is None:
+    if pristine is None or not items:
         return [], items
     digests = pristine["digests"]
-    if len(digests) != pristine["n"]:
-        return [], items
     try:
-        now = front_digests(items)
+        helpers = _front_env()[0]
+        pairs = list(helpers.load_sql_fixture_pairs(TPCDS_FIXTURE))
+        if len(pairs) != pristine["n"] or items[-1] >= len(pairs) or items[0] < 0:
+            return [], items
+        now = front_digests(items, pairs)
     except Exception:
         return [], items
     equal, differing = [], []
     for i in items:
         d = now.get(i)
-        if d is not None and i < len(digests) and digests[i] is not None and d == digests[i]:
+        if d is not None and digests[i] is not None and d == digests[i]:
             equal.append(i)
         else:
             differing.append(i)
     return equal, differing
 
 
-def plan_in_child(test_id, items, rest_items=None, front=None, slice_map=None):
+def estimate_front_cpu(slice_map, items, rest_items, pristine=None, test_id=TPCDS_TEST):
+    """(front check CPU, worst-case CPU) for test_execute_tpcds, or None.
+
+    front check = recomputing the front of the candidates (items not in rest_items);
+    worst case = the check + running every item (nothing proven equal); best case is
+    the check + estimate_cpu(rest_items) (cpu_base included only if rest_items).
+    """
+    pristine = load_front() if pristine is None else pristine
+    full = estimate_cpu(slice_map, test_id, items)
+    if pristine is None or full is None or not pristine.get("cpu"):
+        return None
+    cand = sorted(set(items) - set(rest_items or ()))
+    check = sum(pristine["cpu"][i] for i in cand)
+    return check, check + full
+
+
+def plan_in_child(test_id, items, rest_items=None, front=None, slice_map=None, report=None):
     """Inside a verification child with the patch active, before run_tests().
 
     items: affected() (or affected_split()[0]); rest_items: affected_split()[1].
-    For test_execute_tpcds with pristine front digests, items whose only contact
-    with the patch is the front phase and whose front output is unchanged are
-    dropped. Installs the filter for the remaining items and returns them; an empty
+    For test_execute_tpcds with pristine front digests (load_front()), the items whose
+    only contact with the patch is the front phase and whose front output is unchanged
+    are dropped. Installs the filter for the remaining items and returns them; an empty
     list means T passes without running (do not run it). Raises on any problem (the
-    caller must then keep T selected or run it unfiltered).
+    caller must then keep T selected). report: optional dict, gets "candidates",
+    "equal", "differing", "front_cpu".
     """
+    import time
+
     to_run = set(items)
     if test_id == TPCDS_TEST and front is not None and rest_items is not None:
+        if not set(rest_items) <= to_run:
+            raise ValueError("rest_items must be a subset of items")
         candidates = sorted(to_run - set(rest_items))
-        if candidates:
-            equal, _differing = front_equal(candidates, front)
-            to_run -= set(equal)
+        c0 = time.process_time()
+        equal, differing = front_equal(candidates, front) if candidates else ([], [])
+        to_run -= set(equal)
+        if report is not None:
+            report.update(candidates=candidates, equal=equal, differing=differing,
+                          front_cpu=time.process_time() - c0)
     to_run = sorted(to_run)
     if to_run:
         install_filter(test_id, to_run, slice_map)
     return to_run
 
 
-def build_front(out, root, maps_dir, seeds=(0, 1)):
+def build_front(out, root, maps_dir, seeds=(0, 1), items=None):
     """Build step: pristine front digests under several hash seeds (unstable -> None)."""
     import subprocess
     import tempfile
@@ -698,8 +902,10 @@ def build_front(out, root, maps_dir, seeds=(0, 1)):
         for seed in seeds:
             path = os.path.join(tmp, f"front-{seed}.marshal")
             env = dict(os.environ, PYTHONHASHSEED=str(seed), PYTHONPATH=here, SKIP_INTEGRATION="0")
-            subprocess.run([sys.executable, "-m", "br.slices", "--front-child", path, root, maps_dir],
-                           check=True, env=env, cwd=here)
+            cmd = [sys.executable, "-m", "br.slices", "--front-child", path, root, maps_dir]
+            if items is not None:
+                cmd.append(",".join(str(i) for i in items))
+            subprocess.run(cmd, check=True, env=env, cwd=here)
             with open(path, "rb") as f:
                 runs.append(marshal.load(f))
     n = runs[0]["n"]
@@ -707,22 +913,29 @@ def build_front(out, root, maps_dir, seeds=(0, 1)):
     for i in range(n):
         vals = {r["digests"][i] for r in runs}
         digests.append(vals.pop() if len(vals) == 1 else None)
-    data = {"version": FRONT_VERSION, "test": TPCDS_TEST, "n": n, "digests": digests,
-            "unstable": [i for i in range(n) if digests[i] is None], "seeds": list(seeds)}
-    with open(out, "wb") as f:
-        marshal.dump(data, f)
+    cpu = [max(r["cpu"][i] for r in runs) for i in range(n)]
+    data = {"version": FRONT_VERSION, "test": TPCDS_TEST, "n": n, "digests": digests, "cpu": cpu,
+            "unstable": [i for i in range(n) if digests[i] is None and any(r["digests"][i] for r in runs)],
+            "failed": [i for i in range(n) if all(r["digests"][i] is None for r in runs)],
+            "seeds": list(seeds), "partial": items is not None}
+    if out:
+        with open(out, "wb") as f:
+            marshal.dump(data, f)
     return data
 
 
-def _front_child(out, root, maps_dir):
-    from . import buildstate, unitrun
+def _front_child(out, root, maps_dir, items=None):
+    from . import buildstate, unitrun  # unitrun imports unittest before any sqlglot import
 
     tests = buildstate._tests_from_maps(maps_dir)
     unitrun.build_warm_state(tests, root)
-    d = front_digests()
-    n = len(d)
+    helpers = _front_env()[0]
+    n = len(list(helpers.load_sql_fixture_pairs(TPCDS_FIXTURE)))
+    cpu = {}
+    d = front_digests(items, cpu=cpu)
     with open(out, "wb") as f:
-        marshal.dump({"n": n, "digests": [d[i] for i in range(n)]}, f)
+        marshal.dump({"n": n, "digests": [d.get(i) for i in range(n)],
+                      "cpu": [round(cpu.get(i, 0.0), 6) for i in range(n)]}, f)
 
 
 def _main(argv):
@@ -731,10 +944,12 @@ def _main(argv):
         root = argv[2] if len(argv) > 2 else os.environ.get("BR_ROOT", "/opt/sqlglot")
         maps_dir = argv[3] if len(argv) > 3 else os.path.dirname(DEFAULT_PATH)
         data = build_front(out, root, maps_dir)
-        print(f"front digests: {data['n']} items, unstable {data['unstable']}", file=sys.stderr)
+        print(f"front digests: {data['n']} items, unstable {data['unstable']}, failed {data['failed']}",
+              file=sys.stderr)
         return 0
     if argv[:1] == ["--front-child"]:
-        _front_child(argv[1], argv[2], argv[3])
+        items = [int(x) for x in argv[4].split(",")] if len(argv) > 4 and argv[4] else None
+        _front_child(argv[1], argv[2], argv[3], items)
         return 0
     print("usage: python -m br.slices --build-front OUT [ROOT] [MAPS]", file=sys.stderr)
     return 2
