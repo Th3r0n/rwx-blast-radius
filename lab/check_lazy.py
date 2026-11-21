@@ -20,7 +20,7 @@ def nums(bits):
         bits >>= 1; i += 1
     return out
 n = bad = 0
-for s in sys.argv[1:] or ["sample", "dev1", "ood1", "targeted1"]:
+for s in sys.argv[1:] or ["sample", "dev1", "ood1", "targeted1", "state1"]:
     for lab in sorted(glob.glob(f"/src/lab/corpus/{s}/labels/*.json")):
         L = json.load(open(lab))
         if L.get("status") != "ok": continue

@@ -15,7 +15,7 @@ num = {t["id"]: t["number"] for t in tests}
 maps = Maps("/src/maps")
 bitnum = [num.get(i) for i in maps.tests]
 sel = StaticSelector(maps, "/opt/sqlglot")
-sets = sys.argv[1:] or ["sample", "dev1", "ood1", "targeted1"]
+sets = sys.argv[1:] or ["sample", "dev1", "ood1", "targeted1", "state1"]
 tot_cost = tot_oracle = n = misses = 0
 for s in sets:
     for lab in sorted(glob.glob(f"/src/lab/corpus/{s}/labels/*.json")):

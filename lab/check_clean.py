@@ -17,7 +17,7 @@ bitnum = [num.get(i) for i in maps.tests]
 sel = StaticSelector(maps, "/opt/sqlglot")
 pristine = marshal.load(open("/src/lab/out/state.marshal", "rb"))
 attrs = policy._load_attrs("/src/maps")
-sets = sys.argv[1:] or ["sample", "dev1", "ood1", "targeted1"]
+sets = sys.argv[1:] or ["sample", "dev1", "ood1", "targeted1", "state1"]
 
 def nums(bits):
     out, i = set(), 0
