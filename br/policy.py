@@ -324,3 +324,55 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
             f" {len(failing)} fail; child cpu {info.get('cpu', 0):.2f}s wall {time.monotonic() - t0:.2f}s;"
             f" cells {str(info.get('cells'))[:300]}",
         )
+
+
+def refine_lazy(answers, statics, tests, maps, number_of, unknown, deadline, log, maps_dir, state_path):
+    """Narrow import-time changes in lazily imported modules to their readers."""
+    import ast
+    import marshal
+    import sys
+
+    if "sqlglot" in sys.modules or not os.path.exists(state_path):
+        return
+    jobs = [cid for cid, res in statics.items() if res.lazy and not res.all]
+    if not jobs:
+        return
+    with open(state_path, "rb") as f:
+        state = marshal.load(f)
+    full = state.get("full")
+    if not full:
+        return
+    attrs = _load_attrs(maps_dir)
+    pinned_dicts = dict_attrs(full["cells"])
+    bit_numbers = [number_of.get(test_id) for test_id in maps.tests]
+    for cid in sorted(jobs):
+        if time.monotonic() > deadline:
+            break
+        res = statics[cid]
+        job = verify.Job(cid, [], dict(res.py_files), {p: new for p, _o, new in res.data_changes}, 20.0, 30.0)
+        t0 = time.monotonic()
+        info = verify.run_lazy_diff(job, full)
+        if not info.get("proof") or info.get("error"):
+            log(cid, "lazy diff gave no proof; keeping static answer:", info.get("error"))
+            continue
+        cells = [tuple(c) for c in info.get("cells") or []]
+        funcs = {ast.literal_eval(k): (tuple(v) if v else None) for k, v in (info.get("funcs") or {}).items()}
+        dicts_now = {tuple(c) for c in info.get("dicts") or []}
+        readers = cell_readers(cells, maps, attrs, full["cells"], funcs, dicts_now, pinned_dicts, info.get("subs") or {})
+        if readers is None:
+            log(cid, f"lazy diff: {len(cells)} cells, readers unknown; keeping static answer")
+            continue
+        bits = res.bits | readers
+        chosen, k = set(unknown), 0
+        while bits:
+            if bits & 1 and bit_numbers[k] is not None:
+                chosen.add(bit_numbers[k])
+            bits >>= 1
+            k += 1
+        before = len(answers[cid])
+        answers[cid] = sorted(chosen)
+        log(
+            cid,
+            f"lazy diff: {len(cells)} cells, {before} -> {len(chosen)} tests;"
+            f" child cpu {info.get('cpu', 0):.2f}s wall {time.monotonic() - t0:.2f}s; cells {str(cells)[:200]}",
+        )

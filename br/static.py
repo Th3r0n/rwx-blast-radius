@@ -29,6 +29,11 @@ class Result:
         # Import-time changes in modules loaded during collection: the static
         # answer is ALL; a clean import of the patched tree may narrow it.
         self.clean: list = []
+        # Import-time changes in modules imported lazily (inside tests): the
+        # static answer adds every test that imported them (lazy_bits); a state
+        # diff of the patched module may narrow that to its readers.
+        self.lazy: list = []
+        self.lazy_bits = 0
 
     def add(self, bits: int, why: str):
         if bits:
@@ -176,7 +181,9 @@ class StaticSelector:
                     res.widen(f"import-time change in preloaded module {path}:{change.key}")
                     continue
                 # Lazily imported module: only tests that imported or ran it.
-                res.add(self.maps.file_tests(path), f"import-time change in lazy module {path}")
+                res.lazy.append((path, change))
+                res.lazy_bits |= self.maps.file_tests(path)
+                res.reasons.append(f"import-time change in lazy module {path}")
                 continue
             if change.key in preload:
                 # It ran while the test modules were imported (state built

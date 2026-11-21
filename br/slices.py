@@ -67,6 +67,9 @@ __all__ = [
     "duckdb_single_thread",
     "estimate_cpu",
     "front_equal",
+    "front_digests",
+    "load_front",
+    "plan_in_child",
     "build_front",
 ]
 
@@ -444,14 +447,298 @@ def duckdb_single_thread():
 
 
 # ---------------------------------------------------------------------------
-# test_execute_tpcds: recompute the front phase (see module docstring)
+# test_execute_tpcds: recompute the front phase
+#
+# For item i (pair (meta, sql, _) of tpc-ds.sql) the test does, in this process (the
+# inline pool runs the worker in-process):
+#   main:   expr = parse_one(sql); payload = pickle((mp_execute, (expr, meta), {}))
+#   worker: expr2, meta2 = unpickle(payload); mp_execute(expr2, meta2):
+#           not meta2["execute"] -> None (nothing else happens for the item)
+#           else find_tables(expr2) ..., execute(expr2, schema=_schema, tables=...):
+#             ensure_tables(...), schema = ensure_schema(_schema, dialect=None),
+#             optimize(expr2, schema, leave_tables_isolated=True, dialect=None)  <- front
+#             Plan(...), PythonExecutor(...).execute(...), comparison with duckdb   <- rest
+# The front phase (traced separately) is parse_one + the call-item pickling + optimize.
+# If the patch does not touch item i's rest coverage, the rest runs exactly the pristine
+# code; its inputs from the front are expr2 (find_tables) and optimize's result. When
+# both are structurally identical to the pristine ones (and for non-execute items: the
+# front raises nothing), the item behaves as at the pinned commit: it passes.
 
 TPCDS_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_FIXTURE = "optimizer/tpc-ds/tpc-ds.sql"
+FRONT_VERSION = 1
 
 
-def front_equal(*args, **kwargs):  # pragma: no cover - replaced below when available
-    raise NotImplementedError
+class _Fingerprint:
+    """sha256 over a canonical pre-order walk (own walker: sqlglot's serde may be patched)."""
+
+    def __init__(self, expr_cls):
+        import hashlib
+
+        self.h = hashlib.sha256()
+        self.expr_cls = expr_cls
+
+    def emit(self, tok):
+        self.h.update(repr(tok).encode("utf-8", "backslashreplace"))
+        self.h.update(b"\x00")
+
+    def walk(self, root):
+        expr_cls = self.expr_cls
+        emit = self.emit
+        seen = {}
+        if isinstance(root, expr_cls):
+            emit(("R", root.parent is None, root.arg_key, root.index))
+        stack = [(root, None, None, None)]
+        while stack:
+            v, parent, key, index = stack.pop()
+            if isinstance(v, expr_cls):
+                vid = id(v)
+                if vid in seen:
+                    emit(("ref", seen[vid]))
+                    continue
+                seen[vid] = len(seen)
+                cls = type(v)
+                if parent is not None:
+                    emit(("P", v.parent is parent, v.arg_key == key, v.index == index))
+                args = v.args
+                emit(("N", cls.__module__, cls.__qualname__, len(args), v._hash is not None))
+                tail = [("comments", v.comments), ("type", v._type), ("meta", v._meta)]
+                todo = []
+                for k, val in args.items():
+                    todo.append(("K", k, val))
+                # Push in reverse so that the walk is pre-order, args first.
+                for name, val in reversed(tail):
+                    stack.append((val, None, None, None))
+                    stack.append((_Token(("A", name)), None, None, None))
+                for _tag, k, val in reversed(todo):
+                    if type(val) is list:
+                        for j in range(len(val) - 1, -1, -1):
+                            stack.append((val[j], v, k, j))
+                        stack.append((_Token(("L", len(val))), None, None, None))
+                    else:
+                        stack.append((val, v, k, None))
+                    stack.append((_Token(("K", k)), None, None, None))
+                continue
+            t = type(v)
+            if t is _Token:
+                emit(v.tok)
+            elif v is None or t in (str, int, float, bool, bytes, complex):
+                emit((t.__name__, repr(v)))
+            elif t is list or t is tuple:
+                emit((t.__name__, len(v)))
+                for j in range(len(v) - 1, -1, -1):
+                    stack.append((v[j], None, None, None))
+            elif t is dict:
+                emit(("dict", len(v)))
+                for k2, val in reversed(list(v.items())):
+                    stack.append((val, None, None, None))
+                    stack.append((k2, None, None, None))
+            elif t is set or t is frozenset:
+                emit((t.__name__, tuple(sorted(_flat_repr(x, expr_cls) for x in v))))
+            else:
+                import enum
+
+                if isinstance(v, enum.Enum):
+                    emit(("enum", t.__module__, t.__qualname__, v.name))
+                else:
+                    r = repr(v)
+                    emit(("obj", t.__module__, t.__qualname__, r if " at 0x" not in r else "<object>"))
+        return self.h.digest()
 
 
-def build_front(*args, **kwargs):  # pragma: no cover - replaced below when available
-    raise NotImplementedError
+class _Token:
+    __slots__ = ("tok",)
+
+    def __init__(self, tok):
+        self.tok = tok
+
+
+def _flat_repr(x, expr_cls):
+    if isinstance(x, expr_cls):
+        return "expr:" + _Fingerprint(expr_cls).walk(x).hex()
+    return f"{type(x).__name__}:{x!r}"
+
+
+def fingerprint(expr):
+    """Structural digest of an expression tree (bytes)."""
+    from sqlglot.expressions import Expr
+
+    return _Fingerprint(Expr).walk(expr)
+
+
+def _front_env():
+    """What the test's front phase uses, as bound in the modules the test runs."""
+    import tests.helpers as helpers
+    import tests.test_executor as te
+    import sqlglot.executor as ex
+
+    from . import inlinepool
+
+    return helpers, te, ex, inlinepool
+
+
+def front_digests(items=None, pairs=None):
+    """{item: digest} of the front phase of test_execute_tpcds, computed in this process.
+
+    digest = sha256 over (meta, sql) + ("noexec") for non-execute items, or
+    + fingerprint(unpickled parse_one result) + fingerprint(optimize result); an
+    exception gives ("error", exception type). Uses the functions the test reaches,
+    so in a verification child with the patch active this is the patched front.
+    """
+    import hashlib
+
+    helpers, te, ex, inlinepool = _front_env()
+    if pairs is None:
+        pairs = list(helpers.load_sql_fixture_pairs(TPCDS_FIXTURE))
+    if items is None:
+        items = range(len(pairs))
+    # The worker's _schema: the initializer's arguments after a pickle round trip.
+    schema = inlinepool._loads(inlinepool._dumps(helpers.TPCDS_SCHEMA))
+    out = {}
+    for i in items:
+        meta, sql, _expected = pairs[i]
+        h = hashlib.sha256()
+        h.update(repr((FRONT_VERSION, sorted(meta.items()), sql)).encode("utf-8", "backslashreplace"))
+        try:
+            expr = te.parse_one(sql)
+            payload = inlinepool._dumps((te.mp_execute, (expr, meta), {}))
+            _fn, (expr2, meta2), _kw = inlinepool._loads(payload)
+            if not meta2.get("execute"):
+                h.update(b"noexec")
+            else:
+                h.update(fingerprint(expr2))
+                for _t in te.find_tables(expr2):  # mp_execute walks the tables first
+                    _t.name
+                schema_obj = ex.ensure_schema(schema, dialect=None)
+                optimized = ex.optimize(expr2, schema_obj, leave_tables_isolated=True, dialect=None)
+                h.update(b"opt")
+                h.update(fingerprint(optimized))
+        except Exception as exc:  # the real test would fail (or differ): never equal
+            h.update(repr(("error", type(exc).__qualname__)).encode())
+            out[i] = None
+            continue
+        out[i] = h.digest()
+    return out
+
+
+def load_front(path=None):
+    """Pristine front digests written by --build-front, or None."""
+    if path is None:
+        path = os.environ.get("BR_FRONT") or os.path.join(os.path.dirname(DEFAULT_PATH), "front.marshal")
+    try:
+        with open(path, "rb") as f:
+            data = marshal.load(f)
+    except (OSError, ValueError, EOFError, TypeError):
+        return None
+    if data.get("version") != FRONT_VERSION or data.get("test") != TPCDS_TEST:
+        return None
+    return data
+
+
+def front_equal(items, pristine, fixture_changed=False):
+    """(equal, differing): items of test_execute_tpcds whose front output matches pristine.
+
+    Call inside the verification child with the patch active, before the test runs.
+    `pristine` is load_front(). Items without a stable pristine digest, or whose
+    recomputation raises, are differing. An equal item still needs its rest
+    coverage untouched (affected_split) to be skipped. With fixture_changed the
+    fixture's (meta, sql) are part of the digest, so changed entries differ unless
+    only the unused expected text changed.
+    """
+    items = sorted(set(items))
+    if pristine is None:
+        return [], items
+    digests = pristine["digests"]
+    if len(digests) != pristine["n"]:
+        return [], items
+    try:
+        now = front_digests(items)
+    except Exception:
+        return [], items
+    equal, differing = [], []
+    for i in items:
+        d = now.get(i)
+        if d is not None and i < len(digests) and digests[i] is not None and d == digests[i]:
+            equal.append(i)
+        else:
+            differing.append(i)
+    return equal, differing
+
+
+def plan_in_child(test_id, items, rest_items=None, front=None, slice_map=None):
+    """Inside a verification child with the patch active, before run_tests().
+
+    items: affected() (or affected_split()[0]); rest_items: affected_split()[1].
+    For test_execute_tpcds with pristine front digests, items whose only contact
+    with the patch is the front phase and whose front output is unchanged are
+    dropped. Installs the filter for the remaining items and returns them; an empty
+    list means T passes without running (do not run it). Raises on any problem (the
+    caller must then keep T selected or run it unfiltered).
+    """
+    to_run = set(items)
+    if test_id == TPCDS_TEST and front is not None and rest_items is not None:
+        candidates = sorted(to_run - set(rest_items))
+        if candidates:
+            equal, _differing = front_equal(candidates, front)
+            to_run -= set(equal)
+    to_run = sorted(to_run)
+    if to_run:
+        install_filter(test_id, to_run, slice_map)
+    return to_run
+
+
+def build_front(out, root, maps_dir, seeds=(0, 1)):
+    """Build step: pristine front digests under several hash seeds (unstable -> None)."""
+    import subprocess
+    import tempfile
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    runs = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for seed in seeds:
+            path = os.path.join(tmp, f"front-{seed}.marshal")
+            env = dict(os.environ, PYTHONHASHSEED=str(seed), PYTHONPATH=here, SKIP_INTEGRATION="0")
+            subprocess.run([sys.executable, "-m", "br.slices", "--front-child", path, root, maps_dir],
+                           check=True, env=env, cwd=here)
+            with open(path, "rb") as f:
+                runs.append(marshal.load(f))
+    n = runs[0]["n"]
+    digests = []
+    for i in range(n):
+        vals = {r["digests"][i] for r in runs}
+        digests.append(vals.pop() if len(vals) == 1 else None)
+    data = {"version": FRONT_VERSION, "test": TPCDS_TEST, "n": n, "digests": digests,
+            "unstable": [i for i in range(n) if digests[i] is None], "seeds": list(seeds)}
+    with open(out, "wb") as f:
+        marshal.dump(data, f)
+    return data
+
+
+def _front_child(out, root, maps_dir):
+    from . import buildstate, unitrun
+
+    tests = buildstate._tests_from_maps(maps_dir)
+    unitrun.build_warm_state(tests, root)
+    d = front_digests()
+    n = len(d)
+    with open(out, "wb") as f:
+        marshal.dump({"n": n, "digests": [d[i] for i in range(n)]}, f)
+
+
+def _main(argv):
+    if argv[:1] == ["--build-front"]:
+        out = argv[1]
+        root = argv[2] if len(argv) > 2 else os.environ.get("BR_ROOT", "/opt/sqlglot")
+        maps_dir = argv[3] if len(argv) > 3 else os.path.dirname(DEFAULT_PATH)
+        data = build_front(out, root, maps_dir)
+        print(f"front digests: {data['n']} items, unstable {data['unstable']}", file=sys.stderr)
+        return 0
+    if argv[:1] == ["--front-child"]:
+        _front_child(argv[1], argv[2], argv[3])
+        return 0
+    print("usage: python -m br.slices --build-front OUT [ROOT] [MAPS]", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

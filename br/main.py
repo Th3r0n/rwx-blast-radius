@@ -69,7 +69,7 @@ def main() -> int:
                     chosen = every
                 else:
                     chosen = set(unknown)
-                    bits = res.bits
+                    bits = res.bits | res.lazy_bits
                     i = 0
                     while bits:
                         if bits & 1:
@@ -87,6 +87,24 @@ def main() -> int:
                 answers[cid] = every
 
     if selector is not None and os.environ.get("BR_VERIFY", "1") == "1":
+        try:
+            from . import policy
+
+            if os.environ.get("BR_LAZY", "1") == "1":
+                policy.refine_lazy(
+                    answers,
+                    statics,
+                    tests,
+                    maps,
+                    number_of,
+                    unknown,
+                    deadline=started + float(os.environ.get("BR_DEADLINE", "110")),
+                    log=log,
+                    maps_dir=maps_dir,
+                    state_path=os.environ.get("BR_STATE", os.path.join(os.path.dirname(here), "state.marshal")),
+                )
+        except Exception as exc:  # keep the static answers
+            log("lazy stage failed, keeping static answers:", repr(exc))
         try:
             from . import policy
 

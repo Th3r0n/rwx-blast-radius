@@ -579,3 +579,98 @@ def _child(warm: Warm, job: Job, w: int):
         pass
     if finder is not None:
         os.write(w, (json.dumps({"served": sorted(finder.served)}) + "\n").encode())
+
+
+# ---------------------------------------------------------------------------
+# Lazy mode: state diff of modules that the warm state does not import.
+
+
+def run_lazy_diff(job: Job, pristine_full: dict):
+    """Fork (from a process without sqlglot), import every sqlglot module with
+    the patch served, diff against the pinned all-modules snapshot.
+
+    Returns info with "cells", "funcs", "dicts", "subs" (as run_clean_job), or
+    an "error". No test runs here: the readers are verified later, in the warm
+    state, with the patched module served on demand.
+    """
+    if "sqlglot" in sys.modules:
+        raise RuntimeError("lazy diff needs a process without sqlglot")
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        code = 0
+        try:
+            _lazy_child(job, pristine_full, w)
+        except BaseException as exc:
+            try:
+                os.write(w, (json.dumps({"error": repr(exc)[:500]}) + "\n").encode())
+            except Exception:
+                pass
+            code = 3
+        finally:
+            os._exit(code)
+    os.close(w)
+    _, info = _collect(pid, r, job)
+    return info
+
+
+def _lazy_child(job, pristine_full, w):
+    from . import buildstate, statediff
+    from .policy import _subclass_ids
+
+    _limits(job)
+    gc.disable()
+    modules = {}
+    redirect = {os.path.join(ROOT, p): data for p, data in job.data_files.items()}
+    for path, (old, new) in job.py_files.items():
+        full = os.path.join(ROOT, path)
+        modules[module_name(path)] = (path, codediff.compile_bytes(new, full))
+        redirect[full] = new
+    finder = _PatchedFinder(modules)
+    sys.meta_path.insert(0, finder)
+    _install_redirects(redirect)
+    os.chdir(ROOT)
+    failed = buildstate.import_all_sqlglot(ROOT)
+    for name in modules:
+        if name.startswith("sqlglot") and name in sys.modules and name not in finder.served:
+            raise RuntimeError(f"{name} was imported without the patch")
+    if failed:
+        raise RuntimeError(f"patched modules fail to import: {failed[:5]}")
+    gc.collect()
+    snap = statediff.snapshot(
+        [m for m in sys.modules if m.startswith("sqlglot")],
+        prefix=("sqlglot",),
+        unordered=frozenset(map(tuple, pristine_full["unstable"])),
+    )
+    touched = sorted(finder.served)
+    chaotic = set(map(tuple, pristine_full["chaotic"]))
+    cells = [
+        c
+        for c in statediff.diff(pristine_full["cells"], snap, touched)
+        if c not in chaotic or statediff.cell_module(c) in touched
+    ]
+    funcs = _function_cells(cells, job)
+    dicts_now = set()
+    for cell in cells:
+        if cell[0] == "c":
+            owner = _resolve_class(cell[1])
+            if owner is not None and isinstance(owner.__dict__.get(cell[2]), dict):
+                dicts_now.add(cell)
+    subs_map = {}
+    for c in cells:
+        if c[0] == "c" and c[1] not in subs_map:
+            ids = _subclass_ids(c[1])
+            subs_map[c[1]] = sorted(ids) if ids is not None else None
+    report = {
+        "cells": [list(c) for c in cells[:5000]],
+        "funcs": {repr(k): v for k, v in funcs.items()},
+        "dicts": [list(c) for c in sorted(dicts_now)],
+        "subs": subs_map,
+        "keep": [],
+        "run": [],
+    }
+    if len(cells) > 5000:
+        raise RuntimeError("too many changed cells")
+    os.write(w, (json.dumps(report) + "\n").encode())
+    os.write(w, (json.dumps({"proof": {"served": touched, "cells": len(cells)}}) + "\n").encode())

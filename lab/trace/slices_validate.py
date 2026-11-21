@@ -67,7 +67,11 @@ def main(argv=None):
     p.add_argument("--only-test", default="")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--dry", action="store_true")
+    p.add_argument("--front", default="", help="front.marshal: front mode for test_execute_tpcds only")
     a = p.parse_args(argv)
+    front = slices.load_front(a.front) if a.front else None
+    if a.front and front is None:
+        raise SystemExit(f"cannot load {a.front}")
     os.makedirs(a.out, exist_ok=True)
     tests, _ = unitrun.load_tests_json(a.tests)
     by_id = {t["id"]: t for t in tests}
@@ -122,12 +126,20 @@ def main(argv=None):
                        "hot": hot, "slice": None, "full": None, "est_cpu": None}
                 if items is not None:
                     row["est_cpu"] = slices.estimate_cpu(smap, tid, items)
+                    if tid == slices.TPCDS_TEST:
+                        row["rest_items"] = slices.affected_split(smap, tid, res.changes, res.data_changes)[1]
+                if front is not None and tid != slices.TPCDS_TEST:
+                    continue
                 rows.append(row)
                 if not hot:
                     continue
                 job = verify.Job(cid, [by_id[tid]], dict(res.py_files),
                                  {pth: new for pth, _old, new in res.data_changes},
                                  cpu_limit=6 * t.seconds + 60, wall_limit=10 * t.seconds + 120)
+                if front is not None:
+                    if items:
+                        plan.append((row, "front", job, items))
+                    continue
                 if items:
                     plan.append((row, "slice", job, items))
                 if not a.no_full and (not full_for or n in full_for) and items is not None:
@@ -162,9 +174,17 @@ def main(argv=None):
                 return
             inlinepool.install([m for nm, m in list(sys.modules.items()) if nm.startswith("tests") and m is not None])
             slices.duckdb_single_thread()
-            if items is not None:
-                slices.install_filter(row["test"], items, smap)
             c0 = time.process_time()
+            if kind == "front":
+                to_run = slices.plan_in_child(row["test"], items, row.get("rest_items"), front, smap)
+                out["ran_items"] = to_run
+                out["front_cpu"] = time.process_time() - c0
+                if not to_run:
+                    out.update(outcome="pass", detail=None, test_cpu=0.0, run_cpu=time.process_time() - c0)
+                    dump(out)
+                    return
+            elif items is not None:
+                slices.install_filter(row["test"], items, smap)
             v = unitrun.run_tests([by_id[row["test"]]], root=ROOT, warm=warm.state)[0]
             out.update(outcome=v["outcome"], detail=(v["detail"] or "")[:1500] if v["outcome"] != "pass" else None,
                        test_cpu=v["cpu"], run_cpu=time.process_time() - c0)
@@ -190,7 +210,7 @@ def main(argv=None):
             out["outcome"] = "noproof"
         out["cpu"] = info["cpu"]
         row[kind] = out
-        if kind == "slice" and out.get("outcome") == "pass" and (row["label"] == "fail"):
+        if kind in ("slice", "front") and out.get("outcome") == "pass" and (row["label"] == "fail"):
             log(f"DISAGREEMENT {row['cid']} {row['test']} items={row['items']}")
 
     order = sorted(plan, key=lambda w: -smap.get(w[0]["test"]).seconds)
@@ -228,10 +248,15 @@ def summarize(rows, stats):
         bt["zero"] += r["items"] == []
         bt["items_run"] += len(r["items"])
         bt["items_total"] += r["total"]
-        sv = "pass" if r["items"] == [] else (r["slice"] or {}).get("outcome")
+        ran = r["slice"] or r.get("front")
+        sv = "pass" if r["items"] == [] else (ran or {}).get("outcome")
         fv = (r["full"] or {}).get("outcome")
-        if r["full"] and r["items"] and r["slice"]:
-            bt["cpu_slice"] += r["slice"]["cpu"]
+        if r.get("front"):
+            bt["front_items_run"] = bt.get("front_items_run", 0) + len(r["front"].get("ran_items") or [])
+            bt["front_zero"] = bt.get("front_zero", 0) + (r["front"].get("ran_items") == [])
+            bt["cpu_front"] = bt.get("cpu_front", 0.0) + r["front"]["cpu"]
+        if r["full"] and r["items"] and ran:
+            bt["cpu_slice"] += ran["cpu"]
             bt["cpu_full"] += r["full"]["cpu"]
             bt["cpu_pairs"] += 1
         ref_fail = r["label"] == "fail" or fv == "fail"

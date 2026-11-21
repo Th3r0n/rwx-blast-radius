@@ -27,11 +27,35 @@ def _tests_from_maps(maps_dir):
     return [{"number": i, "id": test_id, "file": test_id.split("::", 1)[0]} for i, test_id in enumerate(index["tests"])]
 
 
-def child(out, root, maps_dir, unordered_path=None):
+def import_all_sqlglot(root):
+    """Import every sqlglot module (not __main__); returns the names that failed."""
+    import importlib
+    import pkgutil
+
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import sqlglot
+
+    failed = []
+    for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        if info.name.endswith("__main__"):
+            continue
+        try:
+            importlib.import_module(info.name)
+        except Exception:
+            failed.append(info.name)
+    return failed
+
+
+def child(out, root, maps_dir, unordered_path=None, full=False):
     from . import statediff, unitrun
 
-    tests = _tests_from_maps(maps_dir)
-    unitrun.build_warm_state(tests, root)
+    if full:
+        os.chdir(root)
+        import_all_sqlglot(root)
+    else:
+        tests = _tests_from_maps(maps_dir)
+        unitrun.build_warm_state(tests, root)
     unordered = frozenset()
     if unordered_path:
         with open(unordered_path, "rb") as f:
@@ -39,20 +63,27 @@ def child(out, root, maps_dir, unordered_path=None):
     import gc
 
     gc.collect()
-    snap = statediff.snapshot(
-        [m for m in sys.modules if m.startswith(("sqlglot", "tests"))], prefix=("sqlglot", "tests"), unordered=unordered
-    )
+    prefix = ("sqlglot",) if full else ("sqlglot", "tests")
+    snap = statediff.snapshot([m for m in sys.modules if m.startswith(prefix)], prefix=prefix, unordered=unordered)
     with open(out, "wb") as f:
         marshal.dump(snap, f)
 
 
 def parent(out, root, maps_dir):
+    warm = _combined(out, root, maps_dir, full=False)
+    full = _combined(out, root, maps_dir, full=True)
+    warm["full"] = full
+    with open(out, "wb") as f:
+        marshal.dump(warm, f)
+
+
+def _combined(out, root, maps_dir, full):
     tmp = os.path.dirname(os.path.abspath(out))
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def run(seed, path, unordered=None):
         env = dict(os.environ, PYTHONHASHSEED=str(seed), PYTHONPATH=here)
-        cmd = [sys.executable, "-m", "br.buildstate", "--child", path, root, maps_dir]
+        cmd = [sys.executable, "-m", "br.buildstate", "--full-child" if full else "--child", path, root, maps_dir]
         if unordered:
             cmd.append(unordered)
         subprocess.run(cmd, check=True, env=env, cwd=here, stdout=subprocess.DEVNULL)
@@ -71,18 +102,20 @@ def parent(out, root, maps_dir):
     again = [run(seed, os.path.join(tmp, f".usnap{seed}"), upath) for seed in (0, 3)]
     chaotic = {key for key in set(again[0]) | set(again[1]) if again[0].get(key) != again[1].get(key)}
     result = {"cells": again[0], "unstable": sorted(unstable, key=repr), "chaotic": sorted(chaotic, key=repr)}
-    with open(out, "wb") as f:
-        marshal.dump(result, f)
     for name in os.listdir(tmp):
         if name.startswith((".snap", ".usnap", ".unordered")):
             os.remove(os.path.join(tmp, name))
-    print(f"state: {len(again[0])} cells, {len(unstable)} unstable, {len(chaotic)} chaotic: {sorted(chaotic, key=repr)[:5]}")
+    print(
+        f"state ({'all modules' if full else 'warm'}): {len(again[0])} cells, {len(unstable)} unstable,"
+        f" {len(chaotic)} chaotic: {sorted(chaotic, key=repr)[:5]}"
+    )
+    return result
 
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if args and args[0] == "--child":
-        child(args[1], args[2], args[3], args[4] if len(args) > 4 else None)
+    if args and args[0] in ("--child", "--full-child"):
+        child(args[1], args[2], args[3], args[4] if len(args) > 4 else None, full=args[0] == "--full-child")
     else:
         out = args[0]
         root = args[1] if len(args) > 1 else "/opt/sqlglot"
