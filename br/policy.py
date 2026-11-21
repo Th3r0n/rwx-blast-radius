@@ -19,6 +19,11 @@ import time
 from . import pack, verify
 
 HEAVY_MS = 1000
+# Measured child CPU / estimate on 40-commit batches of labeled mutants (median):
+# isolated-run calibration over-counts shared class setup and lazy imports.
+EST_PLAIN = 0.65
+EST_SLICED = 0.5
+EST_FRONT = 0.3
 SAFETY = 0.7  # verify only when CPU estimate <= SAFETY * gain
 
 
@@ -92,7 +97,7 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
                     # remaining items within the budget: pay the check, plus the
                     # rest items when the budget allows them.
                     expected = check + (rest_cpu or 0.0)
-                    runnable.append((expected, n))
+                    runnable.append((expected * EST_FRONT, n))
                     fronts[tid] = (f_items, f_rest, worst)
                     continue
             if sliceable and tid in smap:
@@ -106,13 +111,13 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
                     continue
                 c = slmod.estimate_cpu(smap, tid, items)
                 if c is not None:
-                    runnable.append((c, n))
+                    runnable.append((c * EST_SLICED, n))
                     sliced[tid] = items
                     continue
             if n in never or fixture_only:
                 keep.append(n)
                 continue
-            runnable.append((est.get(n, ms[n] / 1000.0), n))
+            runnable.append((est.get(n, ms[n] / 1000.0) * EST_PLAIN, n))
         if dropped:
             chosen = [n for n in chosen if n not in set(dropped)]
             answers[cid] = chosen
@@ -124,11 +129,24 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
         runnable.sort(key=lambda cn: (cn[0] / max(ms[cn[1]], 1), cn[1]))
         base = _cost(chosen, ms)
         best = (0, 0, 0.0)
-        cpu = 0.0
-        for k, (c, n) in enumerate(runnable, start=1):
-            cpu += c * factor
-            rest = [m for m in chosen if m not in {x for _, x in runnable[:k]}]
+        # Evaluate prefixes of every size up to 24, then geometrically spaced sizes
+        # (packing is the costly part), always including the full set.
+        sizes = set(range(1, min(len(runnable), 24) + 1))
+        k = 24
+        while k < len(runnable):
+            k = int(k * 1.3) + 1
+            sizes.add(min(k, len(runnable)))
+        sizes.add(len(runnable))
+        cum = []
+        total = 0.0
+        for c, _n in runnable:
+            total += c * factor
+            cum.append(total)
+        for k in sorted(sizes):
+            removed = {x for _, x in runnable[:k]}
+            rest = [m for m in chosen if m not in removed]
             gain = base - _cost(rest, ms)
+            cpu = cum[k - 1]
             net = SAFETY * gain - cpu * 1000
             if net > best[0]:
                 best = (net, k, cpu)
@@ -186,7 +204,7 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
         log(
             cid,
             f"verified {len(light)} ({len(sliced)} sliced, {len(fronts)} front): {len(failing)} fail, {len(unverified)} unverified, kept {len(keep)};"
-            f" child cpu {info.get('cpu', 0):.2f}s wall {time.monotonic() - t0:.2f}s"
+            f" child cpu {info.get('cpu', 0):.2f}s (est {cpu / factor:.2f}s) wall {time.monotonic() - t0:.2f}s"
             f" proof={info.get('proof')} err={info.get('error')}",
         )
 
@@ -428,6 +446,8 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
         return
     with open(state_path, "rb") as f:
         pristine = marshal.load(f)
+    if "full" in pristine:  # older single-file layout
+        pristine = {k: v for k, v in pristine.items() if k != "full"}
     attrs = _load_attrs(maps_dir)
     pinned_dicts = dict_attrs(pristine["cells"])
     _preload_third_party()
@@ -455,7 +475,9 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
         if time.monotonic() > deadline:
             break
         res = statics[cid]
-        base_bits = res.bits
+        # Lazily imported modules are not loaded in the warm state: their changes keep
+        # every test that imported them (refine_lazy skips commits that need clean mode).
+        base_bits = res.bits | res.lazy_bits
 
         def choose(cells, import_errors, funcs=None, dicts_now=None, subs_map=None, base_bits=base_bits):
             if import_errors:
@@ -521,14 +543,22 @@ def refine_lazy(answers, statics, tests, maps, number_of, unknown, deadline, log
     import marshal
     import sys
 
-    if "sqlglot" in sys.modules or not os.path.exists(state_path):
+    from .buildstate import full_path
+
+    if "sqlglot" in sys.modules:
         return
     jobs = [cid for cid, res in statics.items() if res.lazy and not res.all and not getattr(res, "deleted", False)]
     if not jobs:
         return
-    with open(state_path, "rb") as f:
-        state = marshal.load(f)
-    full = state.get("full")
+    path = full_path(state_path)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            full = marshal.load(f)
+    elif os.path.exists(state_path):
+        with open(state_path, "rb") as f:
+            full = marshal.load(f).get("full")
+    else:
+        return
     if not full:
         return
     attrs = _load_attrs(maps_dir)

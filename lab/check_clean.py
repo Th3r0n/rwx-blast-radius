@@ -52,7 +52,7 @@ for s in sets:
         out["readers"] = None if r is None else nums(r)
         if info.get("keep") is None: out["readers"] = None
         failing = set(L["failing"])
-        base = nums(res.bits)
+        base = nums(res.bits | res.lazy_bits)
         rd = out.get("readers")
         cover = None if rd is None else (rd | base)
         ok = cover is None or failing <= cover

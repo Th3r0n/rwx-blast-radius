@@ -88,3 +88,24 @@ verified by running tests (the verifier cannot make a pinned file disappear).
 ## Wall budget
 Refining stages stop at min(165 s, max(100 s, 2.6 s per commit)); the static
 answer is always ready, so the budget only bounds precision.
+
+## Cells the attribute pass cannot measure
+Dunder attributes, slots and other descriptors, properties, functions generated at
+run time (dataclasses) and names that did not exist at the pinned commit are not
+recorded by the attribute-read pass. A changed cell of that kind selects every way
+the class family can be reached: code naming the attribute or the class, any
+measured read through the class or a subclass, and every test that ran a method of
+the class or a subclass. The build records which cells were measured.
+
+## TPC-DS front proof (tests/test_executor.py::test_execute_tpcds)
+Per query, the coverage of the "front" (parse_one, pickle round trip, the optimize
+call execute() makes) is separated from the rest (planner, Python executor, DuckDB
+comparison). For queries the patch reaches only through the front, the verifier
+recomputes the front with the patch active and compares a structural fingerprint
+of the optimized tree (classes, every argument, types, meta, comments, cached
+hashes against a replica of the pinned hash, parent links) with digests built at
+the pinned commit. Equal trees feed the same unchanged rest, so the query passes.
+The check stops at the first query whose tree differs or raises (the test is then
+kept, unverified), and remaining queries run only when their estimated cost fits
+in the expected saving. Validated on 212 labeled or reference-checked pairs with no
+false pass; every query it skipped was re-run alone and passed.

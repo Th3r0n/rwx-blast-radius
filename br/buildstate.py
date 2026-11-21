@@ -136,13 +136,20 @@ def child(out, root, maps_dir, unordered_path=None, full=False):
         marshal.dump({"cells": snap, "funcs": funcs, "measured": measured}, f)
 
 
+def full_path(state_path):
+    """The all-modules snapshot lives next to the warm one (loaded separately)."""
+    base, ext = os.path.splitext(state_path)
+    return base + "_full" + ext
+
+
 def parent(out, root, maps_dir):
     warm = _combined(out, root, maps_dir, full=False)
     full = _combined(out, root, maps_dir, full=True)
     full["graph"] = import_graph(root)
-    warm["full"] = full
     with open(out, "wb") as f:
         marshal.dump(warm, f)
+    with open(full_path(out), "wb") as f:
+        marshal.dump(full, f)
 
 
 def _combined(out, root, maps_dir, full):

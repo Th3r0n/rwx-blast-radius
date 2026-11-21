@@ -10,7 +10,7 @@ num = {t["id"]: t["number"] for t in tests}
 maps = Maps("/src/maps")
 bitnum = [num.get(i) for i in maps.tests]
 sel = StaticSelector(maps, "/opt/sqlglot")
-full = marshal.load(open("/src/lab/out/state.marshal", "rb"))["full"]
+full = marshal.load(open("/src/lab/out/state_full.marshal", "rb"))
 attrs = policy._load_attrs("/src/maps")
 pd = policy.dict_attrs(full["cells"])
 def nums(bits):
