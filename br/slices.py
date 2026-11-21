@@ -775,7 +775,7 @@ def _front_item(env, schema, meta, sql):
     return h.digest()
 
 
-def front_digests(items=None, pairs=None, cpu=None, stop_on_raise=False, expect=None):
+def front_digests(items=None, pairs=None, cpu=None, stop_on_raise=False, expect=None, stop=None):
     """{item: digest or None} of test_execute_tpcds' front phase, computed here.
 
     Uses the functions the test reaches, so in a verification child with the patch
@@ -808,6 +808,8 @@ def front_digests(items=None, pairs=None, cpu=None, stop_on_raise=False, expect=
             break
         if expect is not None and (out[i] is None or expect.get(i) is None or out[i] != expect[i]):
             break  # first differing item: the caller stops here
+        if stop is not None and stop(i, out[i]):
+            break
     return out
 
 
@@ -886,6 +888,46 @@ def front_until_differ(items, pristine):
         else:
             return equal, i, order[k + 1 :]
     return equal, None, []
+
+
+def front_scan(items, pristine, may_run):
+    """Checks the candidates' fronts (cheapest first). Items whose front differs are
+    collected while may_run(differing) says running them is still affordable; an item
+    whose front raises fails the real test, so the scan stops there.
+
+    Returns (equal, differing, ok): ok is False when the scan stopped early (a raise,
+    an unaffordable set, a fixture mismatch): the caller then keeps the test."""
+    items = sorted(set(items))
+    if pristine is None:
+        return [], items, False
+    if not items:
+        return [], [], True
+    digests = pristine["digests"]
+    cost = pristine.get("cpu") or {}
+    order = sorted(items, key=lambda i: (cost[i] if isinstance(cost, (list, tuple)) and i < len(cost) else 0.0, i))
+    helpers = _front_env()[0]
+    pairs = list(helpers.load_sql_fixture_pairs(TPCDS_FIXTURE))
+    if len(pairs) != pristine["n"] or order[-1] >= len(pairs) or min(order) < 0:
+        return [], items, False
+    differing = []
+    state = {"ok": True}
+
+    def stop(i, digest):
+        if digest is None:
+            state["ok"] = False  # the real item raises: the test fails
+            return True
+        if digests[i] is None or digest != digests[i]:
+            differing.append(i)
+            if not may_run(differing):
+                state["ok"] = False
+                return True
+        return False
+
+    now = front_digests(order, pairs, stop=stop)
+    equal = [i for i in order if now.get(i) is not None and digests[i] is not None and now[i] == digests[i]]
+    if len(now) != len(order):
+        state["ok"] = False
+    return equal, sorted(differing), state["ok"]
 
 
 def estimate_front_cpu(slice_map, items, rest_items, pristine=None, test_id=TPCDS_TEST):

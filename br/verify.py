@@ -644,11 +644,23 @@ def _clean_child(tests_rows, job, pristine, choose, w):
 
         if tp["runtime_rest_ok"] and _tpcds_rest_clear(cells, funcs, pristine, dicts_now, tp["rest"]):
             pristine_front = slmod.load_front()
-            if pristine_front is not None:
-                equal, differing, _unchecked = slmod.front_until_differ(range(pristine_front["n"]), pristine_front)
-                front_note = {"equal": len(equal), "differing": differing}
-                if differing is None and len(equal) == pristine_front["n"]:
+            smap = slmod.load_default()
+            budget = tp.get("budget", 0.0)
+            if pristine_front is not None and smap is not None:
+
+                def may_run(differing):
+                    est = slmod.estimate_cpu(smap, slmod.TPCDS_TEST, sorted(differing))
+                    return est is not None and est <= budget
+
+                equal, differing, ok = slmod.front_scan(range(pristine_front["n"]), pristine_front, may_run)
+                front_note = {"equal": len(equal), "differing": len(differing), "ok": ok}
+                if ok and not differing:
                     to_keep = [n for n in to_keep if n != tp["number"]]
+                elif ok:
+                    # Run the real test on the queries whose optimized tree changed.
+                    slmod.install_filter(slmod.TPCDS_TEST, differing, smap)
+                    to_keep = [n for n in to_keep if n != tp["number"]]
+                    to_run = list(to_run) + [r for r in tests_rows if r["number"] == tp["number"]]
         else:
             front_note = "rest reads changed state"
     report = {
@@ -714,19 +726,26 @@ def _child(warm: Warm, job: Job, w: int):
         budget = getattr(job, "front_budget", 0.0)
         for test_id, (items, rest) in front_jobs.items():
             cand = sorted(set(items) - set(rest))
-            equal, differing, unchecked = slmod.front_until_differ(cand, pristine_front)
+
+            def may_run(differing, rest=rest, test_id=test_id):
+                est = slmod.estimate_cpu(smap, test_id, sorted(set(differing) | set(rest)))
+                return est is not None and est <= budget
+
+            equal, differing, ok = slmod.front_scan(cand, pristine_front, may_run)
             to_run = sorted(set(items) - set(equal))
             est = slmod.estimate_cpu(smap, test_id, to_run) if to_run else 0.0
-            if not to_run:
+            if ok and not to_run:
                 # Every reached item has an unchanged front and no other contact
                 # with the patch: T passes without running.
                 tests = [r for r in tests if r["id"] != test_id]
                 front_pass.append(test_id)
-            elif differing is not None or est is None or est > budget:
-                # A changed front (likely a failure) or too costly to run: keep T
-                # selected, unverified (no verdict is sent for it).
+            elif not ok or est is None or est > budget:
+                # A raising front, or too many items to run: keep T selected,
+                # unverified (no verdict is sent for it).
                 tests = [r for r in tests if r["id"] != test_id]
             else:
+                # Run the real test on the items whose front changed plus those the
+                # patch reaches outside the front.
                 slmod.install_filter(test_id, to_run, smap)
         job.tests = tests
         proof["front"] = {k: len(v[0]) for k, v in front_jobs.items()}

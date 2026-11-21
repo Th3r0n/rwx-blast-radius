@@ -19,6 +19,8 @@ import time
 from . import pack, verify
 
 HEAVY_MS = 1000
+# Pinned CPU of recomputing the front of all 99 TPC-DS queries in a child (seconds).
+TPCDS_FULL_FRONT_CPU = 3.7
 # Tests that start a Python subprocess (test_lazy_load) run from an overlay tree
 # with the patch applied, so they can be verified too.
 SUBPROC_VERIFY = os.environ.get("BR_SUBPROC_VERIFY", "1") == "1"
@@ -210,9 +212,10 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
         job.subproc_ids = subproc_ids
         job.front = {tid: (items, rest) for tid, (items, rest, _w) in fronts.items()}
         if fronts:
-            # Items may run only within what verifying the rest of the job leaves of
-            # the expected saving (in this machine's seconds).
-            job.front_budget = max(0.0, cpu / factor)
+            # Local CPU affordable for running TPC-DS queries whose front changed:
+            # a share of what selecting the test costs, never less than planned.
+            tp_ms = max((ms[number_of[t]] for t in fronts if t in number_of), default=0)
+            job.front_budget = max(cpu / factor, 0.75 * SAFETY * tp_ms / 1000.0 / factor)
             job.cpu_limit = max(job.cpu_limit, cpu / factor * 3 + 8)
             job.wall_limit = max(job.wall_limit, cpu / factor * 4 + 12)
         t0 = time.monotonic()
@@ -588,7 +591,13 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
                 rest_ok = rest_items is not None and not rest_items
             elif res.data_changes:
                 rest_ok = not any(p.startswith("tests/fixtures/optimizer/tpc-ds") for p, _o, _n in res.data_changes)
-            job.tpcds = {"number": tpcds_number, "rest": tpcds_rest, "runtime_rest_ok": rest_ok}
+            job.tpcds = {
+                "number": tpcds_number,
+                "rest": tpcds_rest,
+                "runtime_rest_ok": rest_ok,
+                # local CPU seconds affordable for running changed queries
+                "budget": max(0.0, SAFETY * ms[tpcds_number] / 1000.0 / factor - TPCDS_FULL_FRONT_CPU),
+            }
         t0 = time.monotonic()
         verdicts, info = verify.run_clean_job(tests, job, pristine, choose)
         keep = info.get("keep")
