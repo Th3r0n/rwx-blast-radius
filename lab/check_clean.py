@@ -36,7 +36,7 @@ for s in sets:
         if not res.clean or getattr(res, "hard", False): continue
         n += 1
         out = {}
-        def choose(cells, errs, funcs=None, out=out):
+        def choose(cells, errs, funcs=None, dicts_now=None, subs_map=None, out=out):
             out["cells"] = cells; out["errs"] = errs
             r = policy.cell_readers(cells, maps, attrs, pristine["cells"])
             out["readers"] = None if r is None else nums(r)
@@ -47,7 +47,8 @@ for s in sets:
         out["cells"] = cells
         import ast
         funcs = {ast.literal_eval(k): (tuple(v) if v else None) for k, v in (info.get("funcs") or {}).items()}
-        r = policy.cell_readers(cells, maps, attrs, pristine["cells"], funcs)
+        dnow = {tuple(c) for c in (info.get("dicts") or [])}
+        r = policy.cell_readers(cells, maps, attrs, pristine["cells"], funcs, dnow, policy.dict_attrs(pristine["cells"]), info.get("subs") or {})
         out["readers"] = None if r is None else nums(r)
         if info.get("keep") is None: out["readers"] = None
         failing = set(L["failing"])

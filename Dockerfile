@@ -15,9 +15,10 @@ RUN python -c "import io,tarfile,urllib.request;d=urllib.request.urlopen('https:
 COPY br /app/br
 COPY maps /app/maps
 RUN python -m compileall -q -j 4 /opt/sqlglot /app/br /usr/local/lib/python3.13 > /dev/null 2>&1; \
-    cd /app && SKIP_INTEGRATION=0 python -m br.buildstate /app/state.marshal /opt/sqlglot /app/maps 2>/dev/null \
- && chmod -R a+rX /opt/sqlglot /app
+    (cd /app && SKIP_INTEGRATION=0 python -m br.buildstate /app/state.marshal /opt/sqlglot /app/maps 2>/dev/null \
+     || echo "state snapshot failed: clean mode disabled"); \
+    chmod -R a+rX /opt/sqlglot /app
 
-ENV SKIP_INTEGRATION=0 BR_ROOT=/opt/sqlglot BR_MAPS=/app/maps BR_VERIFY=0
+ENV SKIP_INTEGRATION=0 BR_ROOT=/opt/sqlglot BR_MAPS=/app/maps BR_VERIFY=1 BR_CPU_FACTOR=1.5
 WORKDIR /app
 CMD ["python", "-m", "br"]

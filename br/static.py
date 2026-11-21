@@ -159,9 +159,6 @@ class StaticSelector:
             return res.reasons.append(f"same code {path}")
         for change in changes:
             res.changes.append((path, change))
-        if path.startswith("sqlglot/"):
-            # Subprocess tests import the patched package themselves.
-            res.add(self.maps.subprocs, "tests that start a Python subprocess")
         preloaded = path in self.maps.preload_mods
         if not preloaded and not self.maps.has_file(path):
             # No test ever imported or executed this file, and the patch
@@ -170,6 +167,10 @@ class StaticSelector:
         preload = self.maps.preload.get(path, set())
         for change in changes:
             if change.import_time or change.kind != "function":
+                # Subprocess tests (test_lazy_load) import sqlglot themselves;
+                # their traces include the subprocess, so this selects them
+                # exactly when the subprocess imported this module.
+                res.add(self.maps.subprocs & self.maps.file_tests(path), "subprocess importers")
                 if preloaded:
                     res.clean.append((path, change))
                     res.widen(f"import-time change in preloaded module {path}:{change.key}")

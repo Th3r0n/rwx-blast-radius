@@ -39,7 +39,9 @@ def child(out, root, maps_dir, unordered_path=None):
     import gc
 
     gc.collect()
-    snap = statediff.snapshot([m for m in sys.modules if m.startswith("sqlglot")], unordered=unordered)
+    snap = statediff.snapshot(
+        [m for m in sys.modules if m.startswith(("sqlglot", "tests"))], prefix=("sqlglot", "tests"), unordered=unordered
+    )
     with open(out, "wb") as f:
         marshal.dump(snap, f)
 

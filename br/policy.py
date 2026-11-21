@@ -119,12 +119,26 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
 
 def _load_attrs(maps_dir):
     import marshal
+    import zlib
 
-    path = os.path.join(maps_dir, "attrs.marshal")
+    path = os.path.join(maps_dir, "attrs.bin")
     if not os.path.exists(path):
         return None
     with open(path, "rb") as f:
-        return marshal.load(f)
+        return marshal.loads(zlib.decompress(f.read()))
+
+
+def _set(attrs, i):
+    """Bitset of reader tests (sparse sets are stored as uint16 index arrays)."""
+    v = attrs["sets"][i]
+    if isinstance(v, int):
+        return v
+    import array
+
+    bits = 0
+    for n in array.array("H", v):
+        bits |= 1 << n
+    return bits
 
 
 def _subclass_ids(class_id):
@@ -153,11 +167,22 @@ def _subclass_ids(class_id):
     return out
 
 
-def cell_readers(cells, maps, attrs, pristine_cells, funcs=None):
-    """Bitset of tests that can observe the changed cells, or None (= every test)."""
+def dict_attrs(pristine_cells):
+    """(owner, attr) pairs whose pinned value is a dict (they have key cells)."""
+    return {(c[1], c[2]) for c in pristine_cells if c[0] == "ck"}
+
+
+def cell_readers(cells, maps, attrs, pristine_cells, funcs=None, dicts_now=None, pinned_dicts=None, subs_map=None):
+    """Bitset of tests that can observe the changed cells, or None (= every test).
+
+    funcs: {cell: (path, qualname, firstlineno) | None} for cells holding functions.
+    dicts_now: cells ("c", owner, attr) whose patched value is a dict.
+    pinned_dicts: (owner, attr) pairs that held a dict at the pinned commit.
+    """
     bits = 0
-    sets = attrs["sets"] if attrs else None
     funcs = funcs or {}
+    dicts_now = dicts_now or set()
+    pinned_dicts = pinned_dicts or set()
     for cell in cells:
         kind = cell[0]
         if cell in funcs:
@@ -179,30 +204,38 @@ def cell_readers(cells, maps, attrs, pristine_cells, funcs=None):
         if kind not in ("c", "ck") or attrs is None:
             return None
         cid, attr = cell[1], cell[2]
-        subs = _subclass_ids(cid)
+        if kind == "ck":
+            # Key-level: every access to the dict object goes through the
+            # recording dict, whichever class it was reached through.
+            i = attrs["keys"].get((cid, attr, cell[3]))
+            if i is not None:
+                bits |= _set(attrs, i)
+            i = attrs["allkeys"].get((cid, attr))
+            if i is not None:
+                bits |= _set(attrs, i)
+            continue
+        if cell in dicts_now and (cid, attr) in pinned_dicts:
+            # A dict before and after: the change is exactly its key cells.
+            i = attrs["allkeys"].get((cid, attr))
+            if i is not None:
+                bits |= _set(attrs, i)
+            continue
+        subs = subs_map.get(cid) if subs_map is not None else _subclass_ids(cid)
         if subs is None:
             return None
-        if kind == "c" and cell not in pristine_cells:
+        if cell not in pristine_cells:
             # A new attribute: lookups that used to fail or resolve elsewhere.
             bits |= maps.name_readers(attr)
         i = attrs["owner"].get((cid, attr))
         if i is not None:
-            bits |= sets[i]
+            bits |= _set(attrs, i)
         for sub in subs:
             i = attrs["via"].get((sub, attr))
             if i is not None:
-                bits |= sets[i]
-        if kind == "ck":
-            i = attrs["keys"].get((cid, attr, cell[3]))
-            if i is not None:
-                bits |= sets[i]
-            i = attrs["allkeys"].get((cid, attr))
-            if i is not None:
-                bits |= sets[i]
-        else:
-            i = attrs["allkeys"].get((cid, attr))
-            if i is not None:
-                bits |= sets[i]
+                bits |= _set(attrs, i)
+        i = attrs["allkeys"].get((cid, attr))
+        if i is not None:
+            bits |= _set(attrs, i)
     return bits
 
 
@@ -219,6 +252,7 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
     with open(state_path, "rb") as f:
         pristine = marshal.load(f)
     attrs = _load_attrs(maps_dir)
+    pinned_dicts = dict_attrs(pristine["cells"])
     factor = float(os.environ.get("BR_CPU_FACTOR", "2.5"))
     rows = {t["number"]: t for t in tests}
     bit_numbers = [number_of.get(test_id) for test_id in maps.tests]
@@ -245,13 +279,13 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
         res = statics[cid]
         base_bits = res.bits
 
-        def choose(cells, import_errors, funcs=None, base_bits=base_bits):
+        def choose(cells, import_errors, funcs=None, dicts_now=None, subs_map=None, base_bits=base_bits):
             if import_errors:
                 return [], every
-            readers = cell_readers(cells, maps, attrs, pristine["cells"], funcs)
+            readers = cell_readers(cells, maps, attrs, pristine["cells"], funcs, dicts_now, pinned_dicts, subs_map)
             if readers is None:
                 return [], every
-            bits = readers | base_bits
+            bits = readers | base_bits  # base_bits: runtime candidates and subprocess importers
             chosen, k = set(), 0
             while bits:
                 if bits & 1 and bit_numbers[k] is not None:

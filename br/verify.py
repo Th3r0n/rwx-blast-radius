@@ -378,7 +378,7 @@ def _collect(pid, r, job):
                 if "id" in msg:
                     verdicts[msg["id"]] = msg["outcome"]
                 else:
-                    for key in ("proof", "error", "keep", "cells", "served", "run", "funcs"):
+                    for key in ("proof", "error", "keep", "cells", "served", "run", "funcs", "dicts", "subs"):
                         if key in msg:
                             info[key] = msg[key]
     finally:
@@ -498,7 +498,9 @@ def _clean_child(tests_rows, job, pristine, choose, w):
             raise RuntimeError(f"{name} was imported without the patch")
     gc.collect()  # dead dynamically created classes must not count as subclasses
     snap = statediff.snapshot(
-        [m for m in sys.modules if m.startswith("sqlglot")], unordered=frozenset(map(tuple, pristine["unstable"]))
+        [m for m in sys.modules if m.startswith(("sqlglot", "tests"))],
+        prefix=("sqlglot", "tests"),
+        unordered=frozenset(map(tuple, pristine["unstable"])),
     )
     chaotic = set(map(tuple, pristine["chaotic"]))
     cells = [
@@ -508,12 +510,23 @@ def _clean_child(tests_rows, job, pristine, choose, w):
     ]
     import_errors = sorted(state.import_errors)
     funcs = _function_cells(cells, job)
-    to_run, to_keep = choose(cells, import_errors, funcs)
+    dicts_now = set()
+    for cell in cells:
+        if cell[0] == "c":
+            owner = _resolve_class(cell[1])
+            if owner is not None and isinstance(owner.__dict__.get(cell[2]), dict):
+                dicts_now.add(cell)
+    from .policy import _subclass_ids
+
+    subs_map = {c[1]: (sorted(_subclass_ids(c[1])) if _subclass_ids(c[1]) is not None else None) for c in cells if c[0] == "c"}
+    to_run, to_keep = choose(cells, import_errors, funcs, dicts_now, subs_map)
     report = {
         "cells": [list(c) for c in cells[:5000]],
         "keep": sorted(to_keep),
         "run": [r["number"] for r in to_run],
         "funcs": {repr(k): v for k, v in list(funcs.items())[:500]},
+        "dicts": [list(c) for c in sorted(dicts_now)][:500],
+        "subs": subs_map,
     }
     os.write(w, (json.dumps(report) + "\n").encode())
     from . import inlinepool
