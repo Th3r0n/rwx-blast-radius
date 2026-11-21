@@ -16,6 +16,7 @@ Normalised away (see docs/DECISIONS.md):
 from __future__ import annotations
 
 import dis
+import os
 import types
 from difflib import SequenceMatcher
 
@@ -51,6 +52,37 @@ class Change:
 def compile_bytes(data: bytes, filename: str):
     """Compile like the import system does (honours coding cookies and BOMs)."""
     return compile(data, filename, "exec", dont_inherit=True, optimize=0)
+
+
+_pinned_cache: dict = {}
+
+
+def pinned_code(data: bytes, filename: str):
+    """The pinned file's code object: from the bytecode cache the image build wrote
+    (checked against the source's size and a hash-free header), else compiled."""
+    hit = _pinned_cache.get(filename)
+    if hit is not None:
+        return hit
+    code = None
+    try:
+        import importlib.util
+        import marshal
+
+        pyc = importlib.util.cache_from_source(filename)
+        with open(pyc, "rb") as f:
+            blob = f.read()
+        flags = int.from_bytes(blob[4:8], "little")
+        size = int.from_bytes(blob[12:16], "little")
+        if flags & 1 == 0 and size == (len(data) & 0xFFFFFFFF):
+            mtime = int.from_bytes(blob[8:12], "little")
+            if int(os.stat(filename).st_mtime) & 0xFFFFFFFF == mtime:
+                code = marshal.loads(blob[16:])
+    except Exception:
+        code = None
+    if code is None:
+        code = compile_bytes(data, filename)
+    _pinned_cache[filename] = code
+    return code
 
 
 def _kind(co) -> str:
@@ -163,10 +195,27 @@ def _divergent(old, new):
         mapping = {i: i for i in range(len(oi))}
         lines: set[int] = set()
     else:
-        matcher = SequenceMatcher(None, okeys, nkeys, autojunk=False)
+        # Common prefix and suffix map one to one; only the middle needs the
+        # (quadratic) matcher. Opcodes are shifted back to full indexes.
+        pre = 0
+        top = min(len(okeys), len(nkeys))
+        while pre < top and okeys[pre] == nkeys[pre]:
+            pre += 1
+        suf = 0
+        while suf < top - pre and okeys[len(okeys) - 1 - suf] == nkeys[len(nkeys) - 1 - suf]:
+            suf += 1
+        mid_o = okeys[pre : len(okeys) - suf]
+        mid_n = nkeys[pre : len(nkeys) - suf]
+        opcodes = []
+        if pre:
+            opcodes.append(("equal", 0, pre, 0, pre))
+        for tag, i1, i2, j1, j2 in SequenceMatcher(None, mid_o, mid_n, autojunk=False).get_opcodes():
+            opcodes.append((tag, i1 + pre, i2 + pre, j1 + pre, j2 + pre))
+        if suf:
+            opcodes.append(("equal", len(okeys) - suf, len(okeys), len(nkeys) - suf, len(nkeys)))
         mapping = {}
         lines = set()
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        for tag, i1, i2, j1, j2 in opcodes:
             if tag == "equal":
                 for d in range(i2 - i1):
                     mapping[i1 + d] = j1 + d

@@ -274,7 +274,7 @@ def _activate(warm: Warm, job: Job):
     redirect = {os.path.join(ROOT, p): data for p, data in job.data_files.items()}
     for path, (old, new) in job.py_files.items():
         full = os.path.join(ROOT, path)
-        old_code = codediff.compile_bytes(old, full)
+        old_code = codediff.pinned_code(old, full)
         new_code = codediff.compile_bytes(new, full)
         redirect[full] = new  # readers of the source as data
         name = module_name(path)

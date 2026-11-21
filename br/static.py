@@ -172,7 +172,7 @@ class StaticSelector:
         full = os.path.join(self.root, path)
         res.py_files[path] = (old, new)
         try:
-            old_code = codediff.compile_bytes(old, full)
+            old_code = codediff.pinned_code(old, full)
         except SyntaxError:
             return res.widen(f"pinned {path} does not compile here")
         try:
