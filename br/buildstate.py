@@ -47,9 +47,33 @@ def import_all_sqlglot(root):
     return failed
 
 
+def _import_time_nodes(tree):
+    """Nodes executed when the module is imported: module and class bodies, with
+    their if/try/with blocks, but not function bodies (imports there happen when
+    the function runs) nor `if TYPE_CHECKING:` blocks (never run)."""
+    import ast
+
+    stack = list(tree.body)
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.If):
+            test = ast.unparse(node.test)
+            if "TYPE_CHECKING" in test:
+                stack.extend(node.orelse)
+                continue
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            stack.append(child)
+
+
 def import_graph(root):
-    """{module: sorted modules it imports} for every sqlglot module, from the source
-    (module-level and function-level import statements, relative ones resolved)."""
+    """{module: sorted modules it imports when it is imported} for every sqlglot module,
+    from the source (module and class level import statements, relative ones resolved;
+    imports inside functions or `if TYPE_CHECKING:` do not count)."""
     import ast
 
     graph = {}
@@ -70,7 +94,7 @@ def import_graph(root):
                 tree = ast.parse(open(full, "rb").read())
             except SyntaxError:
                 continue
-            for node in ast.walk(tree):
+            for node in _import_time_nodes(tree):
                 if isinstance(node, ast.Import):
                     for alias in node.names:
                         deps.add(alias.name)
@@ -107,8 +131,9 @@ def child(out, root, maps_dir, unordered_path=None, full=False):
     prefix = ("sqlglot",) if full else ("sqlglot", "tests")
     snap = statediff.snapshot([m for m in sys.modules if m.startswith(prefix)], prefix=prefix, unordered=unordered)
     funcs = statediff.function_keys(list(snap), root)
+    measured = statediff.measured_cells(list(snap))
     with open(out, "wb") as f:
-        marshal.dump({"cells": snap, "funcs": funcs}, f)
+        marshal.dump({"cells": snap, "funcs": funcs, "measured": measured}, f)
 
 
 def parent(out, root, maps_dir):
@@ -133,9 +158,11 @@ def _combined(out, root, maps_dir, full):
         with open(path, "rb") as f:
             got = marshal.load(f)
         funcs_seen.update(got["funcs"])
+        measured_seen.append(set(got["measured"]))
         return got["cells"]
 
     funcs_seen = {}
+    measured_seen = []
 
     snaps = [run(seed, os.path.join(tmp, f".snap{seed}")) for seed in (0, 1, 2)]
     unstable = set()
@@ -153,6 +180,8 @@ def _combined(out, root, maps_dir, full):
         "unstable": sorted(unstable, key=repr),
         "chaotic": sorted(chaotic, key=repr),
         "funcs": funcs_seen,  # pinned function behind each function-valued cell
+        # cells measured by the attribute-read pass in every run (intersection)
+        "measured": sorted(set.intersection(*measured_seen) if measured_seen else set(), key=repr),
     }
     for name in os.listdir(tmp):
         if name.startswith((".snap", ".usnap", ".unordered")):

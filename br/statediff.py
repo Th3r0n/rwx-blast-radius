@@ -317,6 +317,36 @@ def function_keys(cells, root) -> dict:
     return out
 
 
+def measured_cells(cells) -> list:
+    """("c", owner, attr) cells whose live value the attribute-read pass wrapped with a
+    recording descriptor (non-dunder, non-callable, non-descriptor values); reads of
+    the others (dunders, slots, properties, functions) are not in maps/attrs.bin."""
+    import enum as _enum
+
+    out = []
+    for cell in cells:
+        if cell[0] != "c":
+            continue
+        attr = cell[2]
+        if attr.startswith("__") and attr.endswith("__"):
+            continue
+        mod, _, qual = cell[1].partition(":")
+        if "#" in qual:
+            continue
+        obj = sys.modules.get(mod)
+        for part in qual.split("."):
+            obj = getattr(obj, part, None) if obj is not None else None
+        if not isinstance(obj, type) or attr not in obj.__dict__:
+            continue
+        value = obj.__dict__[attr]
+        if isinstance(value, type) or callable(value) or hasattr(type(value), "__get__"):
+            continue
+        if isinstance(obj, _enum.EnumMeta) and attr.startswith("_") and attr.endswith("_"):
+            continue
+        out.append(cell)
+    return out
+
+
 def diff(old: dict, new: dict, touched_modules=()) -> list:
     """Cells that differ: present in only one snapshot, or digests differ.
 

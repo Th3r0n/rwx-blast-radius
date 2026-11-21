@@ -70,6 +70,8 @@ def main(argv=None):
     p.add_argument("--front", default="", help="front.marshal: front mode for test_execute_tpcds only")
     p.add_argument("--no-slice", action="store_true", help="front mode: skip the all-affected-items reference")
     p.add_argument("--patch-dir", default="", help="front mode: extra unlabeled patches (*.patch), set name 'extra'")
+    p.add_argument("--keep-on-raise", action="store_true", help="front mode: plan_in_child(keep_on_raise=True)")
+    p.add_argument("--no-dropcheck", action="store_true", help="front mode: skip phase 2")
     p.add_argument("--front-full", default="unlabeled", choices=["none", "unlabeled", "all"],
                    help="front mode: also run the full test (reference) for these rows")
     a = p.parse_args(argv)
@@ -187,10 +189,15 @@ def main(argv=None):
             c0 = time.process_time()
             if kind == "front":
                 rep = {}
-                to_run = slices.plan_in_child(row["test"], items, row.get("rest_items"), front, smap, report=rep)
+                to_run = slices.plan_in_child(row["test"], items, row.get("rest_items"), front, smap, report=rep,
+                                              keep_on_raise=a.keep_on_raise)
                 out["ran_items"] = to_run
                 out["report"] = rep
                 out["front_cpu"] = rep.get("front_cpu", 0.0)
+                if to_run is None:
+                    out.update(outcome="keep", detail="front raised", test_cpu=0.0, run_cpu=time.process_time() - c0)
+                    dump(out)
+                    return
                 if not to_run:
                     out.update(outcome="pass", detail=None, test_cpu=0.0, run_cpu=time.process_time() - c0)
                     dump(out)
@@ -225,6 +232,8 @@ def main(argv=None):
         elif out.get("error"):
             out["outcome"] = "noproof"
         out["cpu"] = info["cpu"]
+        out["maxrss_kb"] = info.get("maxrss_kb")
+        out["exit"] = info.get("exit")
         row[kind] = out
         if kind in ("slice", "front") and out.get("outcome") == "pass" and (row["label"] == "fail"):
             log(f"DISAGREEMENT {row['cid']} {row['test']} items={row['items']}")
@@ -233,7 +242,7 @@ def main(argv=None):
 
     order = sorted(plan, key=lambda w: -smap.get(w[0]["test"]).seconds)
     wall = pool.run(order, body_of, on_done, lambda w: w[2].wall_limit)
-    if front is not None:
+    if front is not None and not a.no_dropcheck:
         # Phase 2: the dropped items of every front job, in fresh children.
         drop = []
         for row, kind, job, items in plan:
@@ -341,6 +350,25 @@ def summarize_front(rows):
         s["cpu_front_check"] += f.get("front_cpu") or 0.0
         out = f.get("outcome")
         full = (r.get("full") or {}).get("outcome")
+        ref = full or (r.get("slice") or {}).get("outcome") or r["label"]
+        if rep.get("raised"):
+            s.setdefault("raised", {"jobs": 0, "ref_fail": 0, "ref_pass": [], "cpu_child": 0.0})
+            s["raised"]["jobs"] += 1
+            s["raised"]["cpu_child"] += f["cpu"]
+            if ref == "fail":
+                s["raised"]["ref_fail"] += 1
+            else:
+                s["raised"]["ref_pass"].append((r["set"], r["cid"], ref))
+        s["cpu_front_child_all"] = s.get("cpu_front_child_all", 0.0) + f["cpu"]
+        d = r.get("dropcheck")
+        if d is not None and d.get("outcome") != "pass":
+            s["unsound_drop"].append((r["set"], r["cid"], d.get("outcome"), (d.get("detail") or "")[:300]))
+        if d is not None:
+            s["dropcheck_jobs"] = s.get("dropcheck_jobs", 0) + 1
+            s["dropcheck_items"] = s.get("dropcheck_items", 0) + len(rep.get("equal") or [])
+        if out == "keep":
+            s["kept_on_raise"] = s.get("kept_on_raise", 0) + 1
+            continue
         if full is not None:
             s.setdefault("full_ref", {"rows": 0, "front_pass_full_fail": [], "front_fail_full_pass": [],
                                       "slice_vs_full_differ": [], "cpu_full_child": 0.0})
@@ -360,9 +388,6 @@ def summarize_front(rows):
             s["unsound_verdict"].append((r["set"], r["cid"], "front pass, label fail"))
         if out == "fail" and r["label"] == "pass":
             s["front_fail_label_pass"].append((r["set"], r["cid"]))
-        d = r.get("dropcheck")
-        if d is not None and d.get("outcome") != "pass":
-            s["unsound_drop"].append((r["set"], r["cid"], d.get("outcome"), (d.get("detail") or "")[:300]))
         sl = r.get("slice")
         if sl:
             s["cpu_front_child"] += f["cpu"]

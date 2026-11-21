@@ -92,6 +92,7 @@ class Job:
         self.wall_limit = wall_limit
         self.stop_on_fail = stop_on_fail
         self.slices = {}  # {test id: item indexes} for item-sliced tests
+        self.front = {}  # {test id: (items, rest items)} for the TPC-DS front proof
 
 
 def run_job(warm: Warm, job: Job):
@@ -570,8 +571,35 @@ def _child(warm: Warm, job: Job, w: int):
         for test_id, items in sliced.items():
             slmod.install_filter(test_id, items, smap)  # raises: no proof, nothing trusted
         proof["sliced"] = {k: len(v) for k, v in sliced.items()}
+    front_pass = []
+    front_jobs = getattr(job, "front", None) or {}
+    if front_jobs:
+        smap = slmod.load_default()
+        pristine_front = slmod.load_front()
+        tests = list(job.tests)
+        budget = getattr(job, "front_budget", 0.0)
+        for test_id, (items, rest) in front_jobs.items():
+            cand = sorted(set(items) - set(rest))
+            equal, differing, unchecked = slmod.front_until_differ(cand, pristine_front)
+            to_run = sorted(set(items) - set(equal))
+            est = slmod.estimate_cpu(smap, test_id, to_run) if to_run else 0.0
+            if not to_run:
+                # Every reached item has an unchanged front and no other contact
+                # with the patch: T passes without running.
+                tests = [r for r in tests if r["id"] != test_id]
+                front_pass.append(test_id)
+            elif differing is not None or est is None or est > budget:
+                # A changed front (likely a failure) or too costly to run: keep T
+                # selected, unverified (no verdict is sent for it).
+                tests = [r for r in tests if r["id"] != test_id]
+            else:
+                slmod.install_filter(test_id, to_run, smap)
+        job.tests = tests
+        proof["front"] = {k: len(v[0]) for k, v in front_jobs.items()}
     finder = proof.pop("finder", None)
     os.write(w, (json.dumps({"proof": proof}) + "\n").encode())
+    for test_id in front_pass:
+        os.write(w, (json.dumps({"id": test_id, "outcome": "pass"}) + "\n").encode())
 
     class _Stop(Exception):
         pass

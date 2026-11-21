@@ -71,10 +71,30 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
             continue
         sliceable = smap is not None and not getattr(res, "created", False)
         fixture_only = not res.changes and bool(res.data_changes)
-        keep, runnable, sliced, dropped = [], [], {}, []
+        keep, runnable, sliced, dropped, fronts = [], [], {}, [], {}
         for n in chosen:
             tid = rows[n]["id"]
             items = None
+            if sliceable and tid == slmod.TPCDS_TEST and tid in smap and not fixture_only:
+                # Front proof: items reached only through parse/pickle/optimize may be
+                # dropped when their optimized tree is unchanged (br/slices.py).
+                f_items, f_rest = slmod.affected_split(smap, tid, res.changes, res.data_changes)
+                fe = slmod.estimate_front_cpu(smap, f_items, f_rest) if f_items else None
+                if f_items == []:
+                    dropped.append(n)
+                    continue
+                if fe is not None:
+                    check, worst = fe
+                    cand = sorted(set(f_items) - set(f_rest))
+                    rest_cpu = slmod.estimate_cpu(smap, tid, f_rest) if f_rest else 0.0
+                    cand_cpu = (slmod.estimate_cpu(smap, tid, cand) or 0.0) if cand else 0.0
+                    # The child stops at the first changed front and only runs the
+                    # remaining items within the budget: pay the check, plus the
+                    # rest items when the budget allows them.
+                    expected = check + (rest_cpu or 0.0)
+                    runnable.append((expected, n))
+                    fronts[tid] = (f_items, f_rest, worst)
+                    continue
             if sliceable and tid in smap:
                 items = slmod.affected(smap, tid, res.changes, res.data_changes)
             if items is not None:
@@ -117,12 +137,22 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
             continue
         run = [n for _, n in runnable[: best[1]]]
         keep_all = [n for n in chosen if n not in set(run)]
-        plans.append((best[0], cid, run, keep_all, best[2], {rows[n]["id"]: sliced[rows[n]["id"]] for n in run if rows[n]["id"] in sliced}))
+        plans.append(
+            (
+                best[0],
+                cid,
+                run,
+                keep_all,
+                best[2],
+                {rows[n]["id"]: sliced[rows[n]["id"]] for n in run if rows[n]["id"] in sliced},
+                {rows[n]["id"]: fronts[rows[n]["id"]] for n in run if rows[n]["id"] in fronts},
+            )
+        )
     if not plans:
         return
     plans.sort(key=lambda p: (-p[0], p[1]))
     warm = verify.Warm(tests)
-    for _, cid, light, keep, cpu, sliced in plans:
+    for _, cid, light, keep, cpu, sliced, fronts in plans:
         if time.monotonic() > deadline:
             log("deadline reached; remaining commits keep their static answer")
             break
@@ -136,6 +166,13 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
             wall_limit=max(10.0, cpu / factor * 6 + 5),
         )
         job.slices = sliced
+        job.front = {tid: (items, rest) for tid, (items, rest, _w) in fronts.items()}
+        if fronts:
+            # Items may run only within what verifying the rest of the job leaves of
+            # the expected saving (in this machine's seconds).
+            job.front_budget = max(0.0, cpu / factor)
+            job.cpu_limit = max(job.cpu_limit, cpu / factor * 3 + 8)
+            job.wall_limit = max(job.wall_limit, cpu / factor * 4 + 12)
         t0 = time.monotonic()
         verdicts, info = verify.run_job(warm, job)
         failing = []
@@ -148,7 +185,7 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
         answers[cid] = sorted(set(keep) | set(failing) | set(unverified))
         log(
             cid,
-            f"verified {len(light)} ({len(sliced)} sliced): {len(failing)} fail, {len(unverified)} unverified, kept {len(keep)};"
+            f"verified {len(light)} ({len(sliced)} sliced, {len(fronts)} front): {len(failing)} fail, {len(unverified)} unverified, kept {len(keep)};"
             f" child cpu {info.get('cpu', 0):.2f}s wall {time.monotonic() - t0:.2f}s"
             f" proof={info.get('proof')} err={info.get('error')}",
         )
@@ -233,8 +270,42 @@ def _class_users(attrs, subs, cache):
     return bits
 
 
+def _module_path(maps, module):
+    base = module.replace(".", "/")
+    for path in (base + ".py", base + "/__init__.py"):
+        if maps.has_file(path) or path in maps.preload_mods:
+            return path
+    return None
+
+
+def _class_fallback(maps, attrs, cid, attr, subs, cache):
+    """Every way a test could reach an attribute we did not measure: code naming the
+    attribute or the class, any measured read through the class family, and any test
+    that ran a method of the class family."""
+    bits = maps.name_readers(attr)
+    for sub in subs:
+        mod, _, qual = sub.partition(":")
+        qual = qual.split("#", 1)[0]
+        bits |= maps.name_readers(qual.rsplit(".", 1)[-1])
+        path = _module_path(maps, mod)
+        if path is not None:
+            bits |= maps.class_code_tests(path, qual)
+    if attrs is not None:
+        bits |= _class_users(attrs, subs, cache)
+    return bits
+
+
 def cell_readers(
-    cells, maps, attrs, pristine_cells, funcs=None, dicts_now=None, pinned_dicts=None, subs_map=None, pinned_funcs=None
+    cells,
+    maps,
+    attrs,
+    pristine_cells,
+    funcs=None,
+    dicts_now=None,
+    pinned_dicts=None,
+    subs_map=None,
+    pinned_funcs=None,
+    measured=None,
 ):
     """Bitset of tests that can observe the changed cells, or None (= every test).
 
@@ -261,6 +332,7 @@ def cell_readers(
     pinned_funcs = pinned_funcs or {}
     dicts_now = dicts_now or set()
     pinned_dicts = pinned_dicts or set()
+    measured = measured if measured is not None else set()
     cache = {}
     for cell in cells:
         kind = cell[0]
@@ -268,12 +340,13 @@ def cell_readers(
             return None
         is_new = cell not in pristine_cells
         handled_as_function = False
+        unmappable = False
         for table in (pinned_funcs, funcs):
             if cell in table:
                 where = table[cell]
                 handled_as_function = True
                 if where is None:
-                    bits |= maps.name_readers(cell[2])
+                    unmappable = True  # e.g. dataclass-generated methods
                 else:
                     path, qual, line = where
                     bits |= maps.code_tests(path, (qual, line))
@@ -283,6 +356,17 @@ def cell_readers(
         if kind not in ("c", "ck") or attrs is None:
             return None
         cid, attr = cell[1], cell[2]
+        if kind == "c":
+            subs = subs_map.get(cid) if subs_map is not None else _subclass_ids(cid)
+            if subs is None:
+                return None
+            unmeasured = not handled_as_function and cell not in measured and cell not in dicts_now
+            if is_new or unmappable or unmeasured:
+                # Dunders, slots, properties, generated methods, new names: reads
+                # we did not record. Take every way the class family is reached.
+                bits |= _class_fallback(maps, attrs, cid, attr, subs, cache)
+                if is_new or unmappable:
+                    continue
         if kind == "ck":
             # Key-level: every access to the dict object goes through the
             # recording dict, whichever class it was reached through.
@@ -292,13 +376,6 @@ def cell_readers(
             i = attrs["allkeys"].get((cid, attr))
             if i is not None:
                 bits |= _set(attrs, i)
-            continue
-        subs = subs_map.get(cid) if subs_map is not None else _subclass_ids(cid)
-        if subs is None:
-            return None
-        if is_new:
-            bits |= maps.name_readers(attr)
-            bits |= _class_users(attrs, subs, cache)
             continue
         if handled_as_function:
             continue
@@ -321,6 +398,22 @@ def cell_readers(
     return bits
 
 
+def _preload_third_party():
+    """Import the third-party packages the test modules import (sqlglot uses none of
+    them), so every clean child forked from here inherits them instead of paying for
+    them again. Safe before sqlglot: nothing in sqlglot reads them at import."""
+    import gc
+    import importlib
+
+    for name in ("numpy", "pandas", "pandas.testing", "duckdb"):
+        try:
+            importlib.import_module(name)
+        except Exception:
+            pass
+    gc.collect()
+    gc.freeze()
+
+
 def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, maps_dir, state_path):
     """Clean jobs run before the warm state exists in this process (they fork from it bare)."""
     import marshal
@@ -337,6 +430,7 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
         pristine = marshal.load(f)
     attrs = _load_attrs(maps_dir)
     pinned_dicts = dict_attrs(pristine["cells"])
+    _preload_third_party()
     factor = float(os.environ.get("BR_CPU_FACTOR", "2.5"))
     rows = {t["number"]: t for t in tests}
     bit_numbers = [number_of.get(test_id) for test_id in maps.tests]
@@ -367,7 +461,16 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
             if import_errors:
                 return [], every
             readers = cell_readers(
-                cells, maps, attrs, pristine["cells"], funcs, dicts_now, pinned_dicts, subs_map, pristine.get("funcs")
+                cells,
+                maps,
+                attrs,
+                pristine["cells"],
+                funcs,
+                dicts_now,
+                pinned_dicts,
+                subs_map,
+                pristine.get("funcs"),
+                set(map(tuple, pristine.get("measured") or ())),
             )
             if readers is None:
                 return [], every
@@ -445,7 +548,16 @@ def refine_lazy(answers, statics, tests, maps, number_of, unknown, deadline, log
         funcs = {ast.literal_eval(k): (tuple(v) if v else None) for k, v in (info.get("funcs") or {}).items()}
         dicts_now = {tuple(c) for c in info.get("dicts") or []}
         readers = cell_readers(
-            cells, maps, attrs, full["cells"], funcs, dicts_now, pinned_dicts, info.get("subs") or {}, full.get("funcs")
+            cells,
+            maps,
+            attrs,
+            full["cells"],
+            funcs,
+            dicts_now,
+            pinned_dicts,
+            info.get("subs") or {},
+            full.get("funcs"),
+            set(map(tuple, full.get("measured") or ())),
         )
         if readers is None:
             log(cid, f"lazy diff: {len(cells)} cells, readers unknown; keeping static answer")

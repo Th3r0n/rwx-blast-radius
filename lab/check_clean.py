@@ -48,7 +48,7 @@ for s in sets:
         import ast
         funcs = {ast.literal_eval(k): (tuple(v) if v else None) for k, v in (info.get("funcs") or {}).items()}
         dnow = {tuple(c) for c in (info.get("dicts") or [])}
-        r = policy.cell_readers(cells, maps, attrs, pristine["cells"], funcs, dnow, policy.dict_attrs(pristine["cells"]), info.get("subs") or {}, pristine.get("funcs"))
+        r = policy.cell_readers(cells, maps, attrs, pristine["cells"], funcs, dnow, policy.dict_attrs(pristine["cells"]), info.get("subs") or {}, pristine.get("funcs"), set(map(tuple, pristine.get("measured") or ())))
         out["readers"] = None if r is None else nums(r)
         if info.get("keep") is None: out["readers"] = None
         failing = set(L["failing"])

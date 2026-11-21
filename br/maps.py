@@ -87,6 +87,16 @@ class Maps:
             out |= block["sets"][i]
         return out
 
+    def class_code_tests(self, path: str, qualname: str) -> int:
+        """Tests that started any code object of a class (its methods, nested code)."""
+        block = self.block(path)
+        out = 0
+        prefix = qualname + "."
+        for (q, _l), i in block["codes"].items():
+            if q == qualname or q.startswith(prefix):
+                out |= block["sets"][i]
+        return out
+
     def readers(self, path: str) -> int:
         """Tests that opened the file's content (a modification is visible to them)."""
         return self.reads.get(path, 0)

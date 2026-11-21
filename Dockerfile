@@ -19,6 +19,6 @@ RUN python -m compileall -q -j 4 /opt/sqlglot /app/br /usr/local/lib/python3.13 
      || echo "state snapshot failed: clean mode disabled"); \
     chmod -R a+rX /opt/sqlglot /app
 
-ENV SKIP_INTEGRATION=0 BR_ROOT=/opt/sqlglot BR_MAPS=/app/maps BR_VERIFY=1 BR_CPU_FACTOR=1.5
+ENV SKIP_INTEGRATION=0 BR_ROOT=/opt/sqlglot BR_MAPS=/app/maps BR_VERIFY=1 BR_CPU_FACTOR=1.5     OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 WORKDIR /app
 CMD ["python", "-m", "br"]

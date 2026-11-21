@@ -68,15 +68,24 @@ when the patch creates/deletes/renames files, or when the patch is not hot-swapp
                        job.front[TPCDS_TEST] = (items, rest)
              front = load_front()      (maps/front.marshal; None -> use (a) instead)
     child:   1-3 as in (a), then, before any test runs:
-             4. to_run = plan_in_child(TPCDS_TEST, items, rest, front, smap)
+             4. to_run = plan_in_child(TPCDS_TEST, items, rest, front, smap,
+                                       keep_on_raise=True)
                   recomputes the patched front of the candidates (items - rest),
                   drops those whose digest equals the pristine one, and installs the
                   filter for the rest (raises -> treat T as unverified, keep it)
-             5. write the proof; if to_run == []: report T "pass" and remove it from
-                job.tests; else run job.tests (T sees only to_run).
+             5. write the proof; then
+                  to_run is None -> a candidate's front raised, T fails: report no
+                                    verdict for T (it stays selected), do not run it
+                  to_run == []   -> report T "pass", remove it from job.tests
+                  else           -> run job.tests (T sees only to_run).
     plan_in_child must run after _activate (it must see the patched code) and before
     run_tests (setUpClass state and other tests' side effects are not wanted in it).
     The child's CPU limit must allow the check (front cpu of the candidates, <= ~4 s).
+
+Validation (lab/trace/slices_validate.py --front, lab/out/slices/front_validate*/):
+61 labeled corpus pairs + 151 pairs from front-targeted mutants (lab/mutate.py --mix
+front): no front "pass" against a failing label / full run / all-affected-items run,
+and the 4778 items the proof dropped, re-run alone with the patch, all pass.
 """
 
 from __future__ import annotations
@@ -766,13 +775,13 @@ def _front_item(env, schema, meta, sql):
     return h.digest()
 
 
-def front_digests(items=None, pairs=None, cpu=None):
+def front_digests(items=None, pairs=None, cpu=None, stop_on_raise=False, expect=None):
     """{item: digest or None} of test_execute_tpcds' front phase, computed here.
 
     Uses the functions the test reaches, so in a verification child with the patch
     active this is the patched front. None = the recomputation raised (the real item
     would fail or could not be compared). cpu: optional dict filled with per-item CPU
-    seconds.
+    seconds. stop_on_raise: return right after the first None (later items missing).
     """
     import time
 
@@ -795,6 +804,10 @@ def front_digests(items=None, pairs=None, cpu=None):
             out[i] = None
         if cpu is not None:
             cpu[i] = time.process_time() - c0
+        if stop_on_raise and out[i] is None:
+            break
+        if expect is not None and (out[i] is None or expect.get(i) is None or out[i] != expect[i]):
+            break  # first differing item: the caller stops here
     return out
 
 
@@ -814,7 +827,7 @@ def load_front(path=None):
     return data
 
 
-def front_equal(items, pristine):
+def front_equal(items, pristine, stop_on_raise=False, report=None):
     """(equal, differing) among items of test_execute_tpcds: front output == pristine?
 
     Call inside the verification child with the patch active, before the test runs.
@@ -822,6 +835,8 @@ def front_equal(items, pristine):
     recomputation raises, are differing; so is everything when the fixture no longer
     has the recorded number of entries. An equal item still needs its rest coverage
     untouched (affected_split()[1]) to be skipped: plan_in_child() does both.
+    stop_on_raise: stop at the first item whose recomputation raises (the rest are
+    differing); report["raised"] then names it (also set without stop_on_raise).
     """
     items = sorted(set(items))
     if pristine is None or not items:
@@ -832,9 +847,11 @@ def front_equal(items, pristine):
         pairs = list(helpers.load_sql_fixture_pairs(TPCDS_FIXTURE))
         if len(pairs) != pristine["n"] or items[-1] >= len(pairs) or items[0] < 0:
             return [], items
-        now = front_digests(items, pairs)
+        now = front_digests(items, pairs, stop_on_raise=stop_on_raise)
     except Exception:
         return [], items
+    if report is not None:
+        report["raised"] = [i for i in items if i in now and now[i] is None]
     equal, differing = [], []
     for i in items:
         d = now.get(i)
@@ -843,6 +860,32 @@ def front_equal(items, pristine):
         else:
             differing.append(i)
     return equal, differing
+
+
+def front_until_differ(items, pristine):
+    """Checks the candidates' fronts in order of increasing pinned cost and stops at
+    the first one that differs or raises. Returns (equal, first_differing or None,
+    unchecked). Call inside the verification child with the patch active."""
+    items = sorted(set(items))
+    if pristine is None or not items:
+        return [], (items[0] if items else None), items[1:]
+    digests = pristine["digests"]
+    cost = pristine.get("cpu") or {}
+    order = sorted(items, key=lambda i: (cost[i] if isinstance(cost, (list, tuple)) and i < len(cost) else 0.0, i))
+    helpers = _front_env()[0]
+    pairs = list(helpers.load_sql_fixture_pairs(TPCDS_FIXTURE))
+    if len(pairs) != pristine["n"] or order[-1] >= len(pairs) or min(order) < 0:
+        return [], order[0], order[1:]
+    expect = {i: digests[i] for i in order}
+    now = front_digests(order, pairs, expect=expect)
+    equal = []
+    for k, i in enumerate(order):
+        d = now.get(i)
+        if d is not None and digests[i] is not None and d == digests[i]:
+            equal.append(i)
+        else:
+            return equal, i, order[k + 1 :]
+    return equal, None, []
 
 
 def estimate_front_cpu(slice_map, items, rest_items, pristine=None, test_id=TPCDS_TEST):
@@ -861,7 +904,8 @@ def estimate_front_cpu(slice_map, items, rest_items, pristine=None, test_id=TPCD
     return check, check + full
 
 
-def plan_in_child(test_id, items, rest_items=None, front=None, slice_map=None, report=None):
+def plan_in_child(test_id, items, rest_items=None, front=None, slice_map=None, report=None,
+                  keep_on_raise=False):
     """Inside a verification child with the patch active, before run_tests().
 
     items: affected() (or affected_split()[0]); rest_items: affected_split()[1].
@@ -870,7 +914,9 @@ def plan_in_child(test_id, items, rest_items=None, front=None, slice_map=None, r
     are dropped. Installs the filter for the remaining items and returns them; an empty
     list means T passes without running (do not run it). Raises on any problem (the
     caller must then keep T selected). report: optional dict, gets "candidates",
-    "equal", "differing", "front_cpu".
+    "equal", "differing", "raised", "front_cpu".
+    keep_on_raise: when the front of a candidate raises, the real item raises too, so
+    T fails: stop the check and return None (keep T, do not run it; nothing installed).
     """
     import time
 
@@ -880,11 +926,14 @@ def plan_in_child(test_id, items, rest_items=None, front=None, slice_map=None, r
             raise ValueError("rest_items must be a subset of items")
         candidates = sorted(to_run - set(rest_items))
         c0 = time.process_time()
-        equal, differing = front_equal(candidates, front) if candidates else ([], [])
+        rep = {}
+        equal, differing = front_equal(candidates, front, keep_on_raise, rep) if candidates else ([], [])
         to_run -= set(equal)
         if report is not None:
             report.update(candidates=candidates, equal=equal, differing=differing,
-                          front_cpu=time.process_time() - c0)
+                          raised=rep.get("raised", []), front_cpu=time.process_time() - c0)
+        if keep_on_raise and rep.get("raised"):
+            return None
     to_run = sorted(to_run)
     if to_run:
         install_filter(test_id, to_run, slice_map)
