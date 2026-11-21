@@ -61,28 +61,68 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
         if t["file"] == "tests/test_executor.py" or ms[t["number"]] >= HEAVY_MS:
             never.add(t["number"])
 
+    from . import slices as slmod
+
+    smap = slmod.load_default()
     plans = []
     for cid, res in statics.items():
         chosen = answers[cid]
         if not chosen or res.all or not _hot_eligible(res, maps):
             continue
-        if not res.changes and res.data_changes:
-            continue  # only fixture entries changed: their readers almost always fail
-        light = [n for n in chosen if n not in never]
-        if not light:
+        sliceable = smap is not None and not getattr(res, "created", False)
+        fixture_only = not res.changes and bool(res.data_changes)
+        keep, runnable, sliced, dropped = [], [], {}, []
+        for n in chosen:
+            tid = rows[n]["id"]
+            items = None
+            if sliceable and tid in smap:
+                items = slmod.affected(smap, tid, res.changes, res.data_changes)
+            if items is not None:
+                if not items:
+                    dropped.append(n)  # no item and no shared code can see the patch
+                    continue
+                if fixture_only:
+                    keep.append(n)  # its own changed entries: expected to fail
+                    continue
+                c = slmod.estimate_cpu(smap, tid, items)
+                if c is not None:
+                    runnable.append((c, n))
+                    sliced[tid] = items
+                    continue
+            if n in never or fixture_only:
+                keep.append(n)
+                continue
+            runnable.append((est.get(n, ms[n] / 1000.0), n))
+        if dropped:
+            chosen = [n for n in chosen if n not in set(dropped)]
+            answers[cid] = chosen
+            log(cid, f"{len(dropped)} sliced tests cannot reach the patch: dropped")
+        if not runnable:
             continue
-        keep = [n for n in chosen if n in never]
-        gain_ms = _cost(chosen, ms) - _cost(keep, ms)
-        cpu = sum(est.get(n, ms[n] / 1000.0) for n in light) * factor
-        if cpu * 1000 > SAFETY * gain_ms:
-            log(cid, f"not verified: est {cpu:.2f}s cpu vs gain {gain_ms / 1000:.2f}s")
+        # Verify the prefix (cheapest per selected millisecond first) with the best
+        # expected saving if everything passes.
+        runnable.sort(key=lambda cn: (cn[0] / max(ms[cn[1]], 1), cn[1]))
+        base = _cost(chosen, ms)
+        best = (0, 0, 0.0)
+        cpu = 0.0
+        for k, (c, n) in enumerate(runnable, start=1):
+            cpu += c * factor
+            rest = [m for m in chosen if m not in {x for _, x in runnable[:k]}]
+            gain = base - _cost(rest, ms)
+            net = SAFETY * gain - cpu * 1000
+            if net > best[0]:
+                best = (net, k, cpu)
+        if not best[1]:
+            log(cid, f"not verified: best plan does not pay (base {base / 1000:.2f}s)")
             continue
-        plans.append((gain_ms - cpu * 1000, cid, light, keep, cpu))
+        run = [n for _, n in runnable[: best[1]]]
+        keep_all = [n for n in chosen if n not in set(run)]
+        plans.append((best[0], cid, run, keep_all, best[2], {rows[n]["id"]: sliced[rows[n]["id"]] for n in run if rows[n]["id"] in sliced}))
     if not plans:
         return
     plans.sort(key=lambda p: (-p[0], p[1]))
     warm = verify.Warm(tests)
-    for _, cid, light, keep, cpu in plans:
+    for _, cid, light, keep, cpu, sliced in plans:
         if time.monotonic() > deadline:
             log("deadline reached; remaining commits keep their static answer")
             break
@@ -95,6 +135,7 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
             cpu_limit=max(5.0, cpu / factor * 4 + 3),
             wall_limit=max(10.0, cpu / factor * 6 + 5),
         )
+        job.slices = sliced
         t0 = time.monotonic()
         verdicts, info = verify.run_job(warm, job)
         failing = []
@@ -107,7 +148,7 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
         answers[cid] = sorted(set(keep) | set(failing) | set(unverified))
         log(
             cid,
-            f"verified {len(light)}: {len(failing)} fail, {len(unverified)} unverified, kept {len(keep)};"
+            f"verified {len(light)} ({len(sliced)} sliced): {len(failing)} fail, {len(unverified)} unverified, kept {len(keep)};"
             f" child cpu {info.get('cpu', 0):.2f}s wall {time.monotonic() - t0:.2f}s"
             f" proof={info.get('proof')} err={info.get('error')}",
         )
@@ -172,32 +213,70 @@ def dict_attrs(pristine_cells):
     return {(c[1], c[2]) for c in pristine_cells if c[0] == "ck"}
 
 
-def cell_readers(cells, maps, attrs, pristine_cells, funcs=None, dicts_now=None, pinned_dicts=None, subs_map=None):
+def _class_users(attrs, subs, cache):
+    """Tests that read any attribute through one of these classes (or instances of them)."""
+    key = tuple(sorted(subs))
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    index = cache.get("__via_index__")
+    if index is None:
+        index = {}
+        for (via, _attr), i in attrs["via"].items():
+            index.setdefault(via, []).append(i)
+        cache["__via_index__"] = index
+    bits = 0
+    for cid in subs:
+        for i in index.get(cid, ()):
+            bits |= _set(attrs, i)
+    cache[key] = bits
+    return bits
+
+
+def cell_readers(
+    cells, maps, attrs, pristine_cells, funcs=None, dicts_now=None, pinned_dicts=None, subs_map=None, pinned_funcs=None
+):
     """Bitset of tests that can observe the changed cells, or None (= every test).
 
-    funcs: {cell: (path, qualname, firstlineno) | None} for cells holding functions.
+    funcs: {cell: (path, qualname, firstlineno) | None} for cells holding a function now.
+    pinned_funcs: same for the pinned value (from the build-time snapshot).
     dicts_now: cells ("c", owner, attr) whose patched value is a dict.
     pinned_dicts: (owner, attr) pairs that held a dict at the pinned commit.
+    subs_map: {class_id: [ids of the class and its subclasses] | None} (from the child).
+
+    Rules, each a superset of who can observe the cell:
+    - a function value (pinned or patched): the tests that started the pinned code
+      object (callers see changed defaults or a replaced/removed function only by
+      calling it); a function nobody ran cannot matter;
+    - a new attribute or global (absent at the pinned commit): lookups that used to
+      fail or resolve elsewhere: every test that used the class or a subclass (any
+      recorded attribute read through it) plus every code object naming it;
+    - a dict attribute that is a dict before and after: its key cells and whole-dict
+      readers; a key cell: readers of that key and whole-dict readers;
+    - any other class attribute: measured reads through the owner or a subclass;
+    - a module global: code objects naming it (LOAD_GLOBAL / LOAD_ATTR / strings).
     """
     bits = 0
     funcs = funcs or {}
+    pinned_funcs = pinned_funcs or {}
     dicts_now = dicts_now or set()
     pinned_dicts = pinned_dicts or set()
+    cache = {}
     for cell in cells:
         kind = cell[0]
-        if cell in funcs:
-            where = funcs[cell]
-            if where is None:
-                bits |= maps.name_readers(cell[2])
-                continue
-            path, qual, line = where
-            # Changed defaults/decorators are seen only by running it; a
-            # function that was swapped for another one is seen by its callers,
-            # who ran the pinned one.
-            bits |= maps.code_tests(path, (qual, line))
-            if cell not in pristine_cells:
-                bits |= maps.name_readers(cell[2])
-            continue
+        if kind == "mro":
+            return None
+        is_new = cell not in pristine_cells
+        handled_as_function = False
+        for table in (pinned_funcs, funcs):
+            if cell in table:
+                where = table[cell]
+                handled_as_function = True
+                if where is None:
+                    bits |= maps.name_readers(cell[2])
+                else:
+                    path, qual, line = where
+                    bits |= maps.code_tests(path, (qual, line))
         if kind in ("g", "gk"):
             bits |= maps.name_readers(cell[2])
             continue
@@ -214,18 +293,21 @@ def cell_readers(cells, maps, attrs, pristine_cells, funcs=None, dicts_now=None,
             if i is not None:
                 bits |= _set(attrs, i)
             continue
+        subs = subs_map.get(cid) if subs_map is not None else _subclass_ids(cid)
+        if subs is None:
+            return None
+        if is_new:
+            bits |= maps.name_readers(attr)
+            bits |= _class_users(attrs, subs, cache)
+            continue
+        if handled_as_function:
+            continue
         if cell in dicts_now and (cid, attr) in pinned_dicts:
             # A dict before and after: the change is exactly its key cells.
             i = attrs["allkeys"].get((cid, attr))
             if i is not None:
                 bits |= _set(attrs, i)
             continue
-        subs = subs_map.get(cid) if subs_map is not None else _subclass_ids(cid)
-        if subs is None:
-            return None
-        if cell not in pristine_cells:
-            # A new attribute: lookups that used to fail or resolve elsewhere.
-            bits |= maps.name_readers(attr)
         i = attrs["owner"].get((cid, attr))
         if i is not None:
             bits |= _set(attrs, i)
@@ -282,7 +364,9 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
         def choose(cells, import_errors, funcs=None, dicts_now=None, subs_map=None, base_bits=base_bits):
             if import_errors:
                 return [], every
-            readers = cell_readers(cells, maps, attrs, pristine["cells"], funcs, dicts_now, pinned_dicts, subs_map)
+            readers = cell_readers(
+                cells, maps, attrs, pristine["cells"], funcs, dicts_now, pinned_dicts, subs_map, pristine.get("funcs")
+            )
             if readers is None:
                 return [], every
             bits = readers | base_bits  # base_bits: runtime candidates and subprocess importers
@@ -358,7 +442,9 @@ def refine_lazy(answers, statics, tests, maps, number_of, unknown, deadline, log
         cells = [tuple(c) for c in info.get("cells") or []]
         funcs = {ast.literal_eval(k): (tuple(v) if v else None) for k, v in (info.get("funcs") or {}).items()}
         dicts_now = {tuple(c) for c in info.get("dicts") or []}
-        readers = cell_readers(cells, maps, attrs, full["cells"], funcs, dicts_now, pinned_dicts, info.get("subs") or {})
+        readers = cell_readers(
+            cells, maps, attrs, full["cells"], funcs, dicts_now, pinned_dicts, info.get("subs") or {}, full.get("funcs")
+        )
         if readers is None:
             log(cid, f"lazy diff: {len(cells)} cells, readers unknown; keeping static answer")
             continue

@@ -131,6 +131,7 @@ class StaticSelector:
         return None
 
     def _created(self, fp, res: Result):
+        res.created = True
         path = fp.new_path
         directory = posixpath.dirname(path)
         listers = self.maps.dir_listers(directory)

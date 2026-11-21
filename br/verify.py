@@ -91,6 +91,7 @@ class Job:
         self.cpu_limit = cpu_limit
         self.wall_limit = wall_limit
         self.stop_on_fail = stop_on_fail
+        self.slices = {}  # {test id: item indexes} for item-sliced tests
 
 
 def run_job(warm: Warm, job: Job):
@@ -560,6 +561,15 @@ def _child(warm: Warm, job: Job, w: int):
     from . import inlinepool
 
     inlinepool.install([m for n, m in list(sys.modules.items()) if n.startswith("tests") and m is not None])
+    from . import slices as slmod
+
+    slmod.duckdb_single_thread()  # stay far below the container's thread limit
+    sliced = getattr(job, "slices", None) or {}
+    if sliced:
+        smap = slmod.load_default()
+        for test_id, items in sliced.items():
+            slmod.install_filter(test_id, items, smap)  # raises: no proof, nothing trusted
+        proof["sliced"] = {k: len(v) for k, v in sliced.items()}
     finder = proof.pop("finder", None)
     os.write(w, (json.dumps({"proof": proof}) + "\n").encode())
 

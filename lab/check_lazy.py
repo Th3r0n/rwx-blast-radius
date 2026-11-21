@@ -35,7 +35,7 @@ for s in sys.argv[1:] or ["sample", "dev1", "ood1", "targeted1"]:
             print("NOPROOF", s, cid, info.get("error")); continue
         cells = [tuple(c) for c in info["cells"]]
         funcs = {ast.literal_eval(k): (tuple(v) if v else None) for k, v in (info.get("funcs") or {}).items()}
-        r = policy.cell_readers(cells, maps, attrs, full["cells"], funcs, {tuple(c) for c in info.get("dicts") or []}, pd, info.get("subs") or {})
+        r = policy.cell_readers(cells, maps, attrs, full["cells"], funcs, {tuple(c) for c in info.get("dicts") or []}, pd, info.get("subs") or {}, full.get("funcs"))
         cover = None if r is None else nums(r | res.bits)
         ok = cover is None or failing <= cover
         bad += not ok

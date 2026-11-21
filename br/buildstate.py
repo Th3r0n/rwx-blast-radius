@@ -65,8 +65,9 @@ def child(out, root, maps_dir, unordered_path=None, full=False):
     gc.collect()
     prefix = ("sqlglot",) if full else ("sqlglot", "tests")
     snap = statediff.snapshot([m for m in sys.modules if m.startswith(prefix)], prefix=prefix, unordered=unordered)
+    funcs = statediff.function_keys(list(snap), root)
     with open(out, "wb") as f:
-        marshal.dump(snap, f)
+        marshal.dump({"cells": snap, "funcs": funcs}, f)
 
 
 def parent(out, root, maps_dir):
@@ -88,7 +89,11 @@ def _combined(out, root, maps_dir, full):
             cmd.append(unordered)
         subprocess.run(cmd, check=True, env=env, cwd=here, stdout=subprocess.DEVNULL)
         with open(path, "rb") as f:
-            return marshal.load(f)
+            got = marshal.load(f)
+        funcs_seen.update(got["funcs"])
+        return got["cells"]
+
+    funcs_seen = {}
 
     snaps = [run(seed, os.path.join(tmp, f".snap{seed}")) for seed in (0, 1, 2)]
     unstable = set()
@@ -101,7 +106,12 @@ def _combined(out, root, maps_dir, full):
         marshal.dump(sorted(unstable, key=repr), f)
     again = [run(seed, os.path.join(tmp, f".usnap{seed}"), upath) for seed in (0, 3)]
     chaotic = {key for key in set(again[0]) | set(again[1]) if again[0].get(key) != again[1].get(key)}
-    result = {"cells": again[0], "unstable": sorted(unstable, key=repr), "chaotic": sorted(chaotic, key=repr)}
+    result = {
+        "cells": again[0],
+        "unstable": sorted(unstable, key=repr),
+        "chaotic": sorted(chaotic, key=repr),
+        "funcs": funcs_seen,  # pinned function behind each function-valued cell
+    }
     for name in os.listdir(tmp):
         if name.startswith((".snap", ".usnap", ".unordered")):
             os.remove(os.path.join(tmp, name))

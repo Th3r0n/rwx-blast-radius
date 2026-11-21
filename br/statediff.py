@@ -281,6 +281,42 @@ def cell_module(key) -> str:
     return owner.split(":", 1)[0] if key[0] in ("c", "ck", "mro") else owner
 
 
+def function_keys(cells, root) -> dict:
+    """{cell: (path, qualname, firstlineno)} for ("c"/"g") cells whose live value is
+    a function (or classmethod/staticmethod/property/wrapper of one) defined under root."""
+    out = {}
+    prefix = root.rstrip("/") + "/"
+    for cell in cells:
+        if cell[0] not in ("c", "g"):
+            continue
+        if cell[0] == "c":
+            mod, _, qual = cell[1].partition(":")
+            if "#" in qual:
+                continue
+            obj = sys.modules.get(mod)
+            for part in qual.split("."):
+                obj = getattr(obj, part, None) if obj is not None else None
+            if not isinstance(obj, type):
+                continue
+            value = obj.__dict__.get(cell[2])
+        else:
+            module = sys.modules.get(cell[1])
+            value = vars(module).get(cell[2]) if module is not None else None
+        fn = value
+        if isinstance(fn, (classmethod, staticmethod)):
+            fn = fn.__func__
+        elif isinstance(fn, property):
+            fn = fn.fget
+        seen = 0
+        while hasattr(fn, "__wrapped__") and seen < 10:
+            fn = fn.__wrapped__
+            seen += 1
+        if isinstance(fn, types.FunctionType) and fn.__code__.co_filename.startswith(prefix):
+            co = fn.__code__
+            out[cell] = (co.co_filename[len(prefix):], co.co_qualname, co.co_firstlineno)
+    return out
+
+
 def diff(old: dict, new: dict, touched_modules=()) -> list:
     """Cells that differ: present in only one snapshot, or digests differ.
 

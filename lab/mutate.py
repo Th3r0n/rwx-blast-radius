@@ -4,8 +4,10 @@
     python /lab/mutate.py gen --set ood1 --n 100 --seed 202 --mix ood
     python /lab/mutate.py gen --set targeted1 --n 150 --seed 303 --mix targeted
     python /lab/mutate.py gen --set holdout1 --n 200 --seed 909 --mix default --holdout
+    python /lab/mutate.py gen --set state1 --n 150 --seed 404 --mix state
     python /lab/mutate.py copy --set sample --src /kit/sample/commits
     python /lab/mutate.py selftest --src /kit/sample/commits
+    python /lab/mutate.py collected   (needs -v <repo>/br:/br:ro -v <repo>/lab/data:/lab/data)
 
 Every mutant is made in a scratch copy of /opt/sqlglot (a git repo), the patch
 is `git add -A && git diff --cached` (so new and deleted files work too),
@@ -20,6 +22,13 @@ Mixes (kind shares follow the 30 sample commits):
             fixtures outside optimizer/, sqlglot/typing, serde, ';' in fixtures
   ood       multi-line edits, function add/remove/rename, new imports, new and
             deleted files, tests/*.py edits, sqlglotc/, docs, __init__.py
+  state     import-time state only (module/class bodies, def headers): class
+            and module dict values (arg_types True<->False), class/module
+            constants (int +-1, bool flip, str one char, None<->literal where an
+            annotation or a same-named assignment allows it), default values
+            (copy=), decorator arguments; 60% in sqlglot modules pytest
+            collection does not import (lazy), 40% in collected ones, split
+            from data/collection_modules.json (`collected` writes it)
 Deterministic for a given --seed (and corpus ids already taken).
 """
 
@@ -41,6 +50,7 @@ import warnings
 from pathlib import Path
 
 PRISTINE = Path("/opt/sqlglot")
+COLLECTION_MODULES = Path(__file__).resolve().parent / "data" / "collection_modules.json"
 ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
 
 COMMENTS = [
@@ -310,6 +320,404 @@ def default_sites(src: Source):
     return out
 
 
+# ---------------------------------------------------------------- import-time state sites
+# Constants whose value is fixed while the module is imported: module and class
+# bodies (through if/try/for/with, minus `if TYPE_CHECKING:` bodies, docstrings,
+# annotations and lambda bodies), plus def headers (default values, decorators)
+# of the functions defined there. Function bodies are never touched.
+
+STATE_OPS = {
+    # operator: weight
+    "arg_types": 3.0,          # `arg_types = {...}` value True<->False
+    "cls_dict_value": 3.0,     # other class-level dict entry value (bool/int/str/None literal)
+    "cls_dict_swap": 1.0,      # swap two neighbouring values of a class-level dict
+    "cls_const": 3.0,          # any other constant in a class-body statement
+    "def_default": 2.5,        # constant in a default argument value
+    "def_default_copy": 1.0,   # copy=True <-> copy=False default
+    "decorator_arg": 1.0,      # constant in a decorator expression
+    "mod_const": 1.5,          # constant in a module-level statement
+    "mod_dict_value": 1.5,     # module-level dict entry value (or a swap of two)
+}
+
+_TYPING_HEADS = {"Optional", "Union", "Type", "List", "Dict", "Tuple", "Set", "FrozenSet",
+                 "Callable", "Literal", "Sequence", "Collection", "Iterable", "Iterator",
+                 "Mapping", "MutableMapping", "ClassVar", "Generic", "Protocol"}
+
+
+def _ann_kinds(ann: ast.AST | None) -> set[str]:
+    """{'bool','int','str','none'} for simple annotations (X, Optional[X], X | None,
+    Union[...] of those); empty when the annotation is anything else."""
+    if ann is None:
+        return set()
+    if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+        try:
+            ann = ast.parse(ann.value, mode="eval").body
+        except SyntaxError:
+            return set()
+    members: list[ast.AST] = []
+
+    def flat(n):
+        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr):
+            flat(n.left)
+            flat(n.right)
+        elif isinstance(n, ast.Subscript) and _last_name(n.value) in ("Optional", "Union"):
+            if _last_name(n.value) == "Optional":
+                members.append(ast.Constant(None))
+            sl = n.slice
+            for e in (sl.elts if isinstance(sl, ast.Tuple) else [sl]):
+                flat(e)
+        else:
+            members.append(n)
+
+    flat(ann)
+    kinds = set()
+    for m in members:
+        if isinstance(m, ast.Constant) and m.value is None:
+            kinds.add("none")
+        elif _last_name(m) in ("bool", "int", "str"):
+            kinds.add(_last_name(m))
+        else:
+            return set()
+    return kinds
+
+
+def _last_name(n: ast.AST) -> str | None:
+    if isinstance(n, ast.Name):
+        return n.id
+    if isinstance(n, ast.Attribute):
+        return n.attr
+    return None
+
+
+def _const_kind(v) -> str | None:
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, int):
+        return "int"
+    if isinstance(v, str):
+        return "str"
+    if v is None:
+        return "none"
+    return None
+
+
+def _is_type_checking(test: ast.AST) -> bool:
+    return _last_name(test) == "TYPE_CHECKING"
+
+
+def _is_doc(stmt: ast.AST) -> bool:
+    return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str))
+
+
+def _target_name(stmt: ast.AST) -> str | None:
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+        return _last_name(stmt.targets[0])
+    if isinstance(stmt, ast.AnnAssign):
+        return _last_name(stmt.target)
+    return None
+
+
+def import_time_roots(tree: ast.Module):
+    """Yields (where, ctx, expr, info) for every expression evaluated at import time.
+
+    where: 'module' or 'class'; ctx: 'stmt', 'default' or 'decorator';
+    info: {'label', 'name' (assignment target or arg), 'ann' (annotation node),
+    'value' (True for the whole right-hand side of an assignment)}."""
+
+    def body(stmts, where, qual):
+        for st in stmts:
+            if _is_doc(st):
+                continue
+            if isinstance(st, ast.ClassDef):
+                q = f"{qual}.{st.name}" if qual else st.name
+                for d in st.decorator_list:
+                    yield where, "decorator", d, {"label": f"@{q}"}
+                for b in st.bases + [k.value for k in st.keywords]:
+                    yield where, "stmt", b, {"label": f"{q}(bases)"}
+                yield from body(st.body, "class", q)
+            elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                q = f"{qual}.{st.name}" if qual else st.name
+                for d in st.decorator_list:
+                    yield where, "decorator", d, {"label": f"@{q}"}
+                a = st.args
+                pos = a.posonlyargs + a.args
+                pairs = list(zip(pos[len(pos) - len(a.defaults):], a.defaults))
+                pairs += [(arg, d) for arg, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None]
+                for arg, d in pairs:
+                    yield where, "default", d, {"label": f"{q}({arg.arg}=)", "name": arg.arg,
+                                                "ann": arg.annotation, "value": True}
+            elif isinstance(st, ast.If):
+                if _is_type_checking(st.test):
+                    yield from body(st.orelse, where, qual)
+                    continue
+                yield where, "stmt", st.test, {"label": f"{qual or '<module>'} if"}
+                yield from body(st.body, where, qual)
+                yield from body(st.orelse, where, qual)
+            elif isinstance(st, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+                yield from body(st.body, where, qual)
+                for h in st.handlers:
+                    yield from body(h.body, where, qual)
+                yield from body(st.orelse, where, qual)
+                yield from body(st.finalbody, where, qual)
+            elif isinstance(st, (ast.For, ast.AsyncFor)):
+                yield where, "stmt", st.iter, {"label": f"{qual or '<module>'} for"}
+                yield from body(st.body, where, qual)
+                yield from body(st.orelse, where, qual)
+            elif isinstance(st, ast.While):
+                yield where, "stmt", st.test, {"label": f"{qual or '<module>'} while"}
+                yield from body(st.body, where, qual)
+                yield from body(st.orelse, where, qual)
+            elif isinstance(st, (ast.With, ast.AsyncWith)):
+                for it in st.items:
+                    yield where, "stmt", it.context_expr, {"label": f"{qual or '<module>'} with"}
+                yield from body(st.body, where, qual)
+            elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                if st.value is None:
+                    continue
+                name = _target_name(st)
+                label = f"{qual}.{name}" if qual and name else (name or qual or "<module>")
+                yield where, "stmt", st.value, {"label": label, "name": name,
+                                                "ann": getattr(st, "annotation", None),
+                                                "value": not isinstance(st, ast.AugAssign)}
+                if isinstance(st, ast.Assign):
+                    for tgt in st.targets:  # X["key"] = ... at import time
+                        if isinstance(tgt, ast.Subscript):
+                            yield where, "stmt", tgt.slice, {"label": label}
+            elif isinstance(st, (ast.Expr, ast.Assert)):
+                for child in ast.iter_child_nodes(st):
+                    yield where, "stmt", child, {"label": f"{qual or '<module>'} expr"}
+            # imports, pass, del, raise, match, type aliases: nothing to mutate
+
+    yield from body(tree.body, "module", "")
+
+
+def _consts(root: ast.AST, direct_role: str):
+    """(Constant node, role) for constants evaluated with root; role is direct_role
+    for root itself (or -root), 'dict_value' for direct dict values, else 'other'.
+    Skips lambda bodies, f-strings, typing subscripts and cast()/TypeVar() names."""
+    out = []
+
+    def visit(n, role, in_dict=None):
+        if isinstance(n, ast.Constant):
+            if _const_kind(n.value) is not None:
+                out.append((n, role, in_dict))
+            return
+        if isinstance(n, ast.UnaryOp) and isinstance(n.operand, ast.Constant):
+            visit(n.operand, role, in_dict)
+            return
+        if isinstance(n, ast.Lambda):
+            for d in n.args.defaults + [d for d in n.args.kw_defaults if d is not None]:
+                visit(d, "other")
+            return
+        if isinstance(n, ast.JoinedStr):
+            return
+        if isinstance(n, ast.Subscript) and _last_name(n.value) in _TYPING_HEADS:
+            return
+        if isinstance(n, ast.Call):
+            fname = _last_name(n.func)
+            if fname == "TypeVar":
+                return
+            if fname == "cast" and n.args:
+                for a in n.args[1:]:
+                    visit(a, "other")
+                return
+        if isinstance(n, ast.Dict):
+            for k, v in zip(n.keys, n.values):
+                if k is not None:
+                    visit(k, "other")
+                visit(v, "dict_value", n)
+            return
+        for child in ast.iter_child_nodes(n):
+            visit(child, "other")
+
+    visit(root, direct_role)
+    return out
+
+
+def _str_alternatives(src: Source, node: ast.Constant, seed: str) -> list[str]:
+    """One-character edits (replace, delete, insert) of a single-line string literal."""
+    s, e = src.aoff(node.lineno, node.col_offset), src.aoff(node.end_lineno, node.end_col_offset)
+    text = src.text[s:e]
+    if "\n" in text:
+        return []
+    try:
+        toks = [t for t in tokenize.generate_tokens(io.StringIO(text).readline)
+                if t.type not in (tokenize.NEWLINE, tokenize.NL, tokenize.ENDMARKER)]
+    except (tokenize.TokenError, SyntaxError):
+        return []
+    if len(toks) != 1 or toks[0].type != tokenize.STRING:
+        return []  # implicit concatenation
+    m = re.match(r"[rRbBuU]{0,2}", text)
+    prefix = m.group()
+    if "b" in prefix.lower():
+        return []
+    q = text[len(prefix):len(prefix) + 3]
+    qlen = 3 if q in ('"""', "'''") else 1
+    head, body = text[: len(prefix) + qlen], text[len(prefix) + qlen: len(text) - qlen]
+    tail = text[len(text) - qlen:]
+    if not body:
+        return [head + "x" + tail]
+
+    def escaped(i):  # is body[i] the character right after a backslash escape?
+        n = 0
+        while i - 1 - n >= 0 and body[i - 1 - n] == "\\":
+            n += 1
+        return n % 2 == 1
+
+    spots = [i for i, c in enumerate(body) if c.isalnum() and not escaped(i)]
+    if not spots:
+        return [head + body + "x" + tail] if not body.endswith("\\") else []
+    r = random.Random(seed)
+
+    def other(c):
+        if c.isdigit():
+            return str((int(c) + 1) % 10)
+        new = "q" if c.lower() == "x" else "x"
+        return new.upper() if c.isupper() else new
+
+    i, j, k = r.choice(spots), r.choice(spots), r.choice(spots)
+    ins = "X" if body[k].isupper() else "x"
+    alts = [
+        head + body[:i] + other(body[i]) + body[i + 1:] + tail,
+        head + body[:k] + ins + body[k:] + tail,
+    ]
+    if len(body) >= 2:
+        alts.append(head + body[:j] + body[j + 1:] + tail)
+    return [a for a in dict.fromkeys(alts) if a != text]
+
+
+def state_sites(src: Source, name_kinds: dict[str, dict[str, str]]) -> dict[str, list]:
+    """{operator: [(desc, [edit-list choices])]} for import-time constants of src.
+
+    name_kinds maps an attribute name to {kind: literal text} seen for class/module
+    assignments of that name across sqlglot (plus annotation kinds); it decides
+    where None <-> literal stays valid."""
+    out: dict[str, list] = {op: [] for op in STATE_OPS}
+    seen_dicts: set[int] = set()
+    for where, ctx, root, info in import_time_roots(src.tree):
+        label = info.get("label", "")
+        direct = "value" if info.get("value") else "other"
+        for node, role, in_dict in _consts(root, direct):
+            v = node.value
+            kind = _const_kind(v)
+            s, e = src.aoff(node.lineno, node.col_offset), src.aoff(node.end_lineno, node.end_col_offset)
+            old = src.text[s:e]
+            if ctx == "decorator":
+                op = "decorator_arg"
+            elif ctx == "default":
+                op = "def_default_copy" if (info.get("name") == "copy" and kind == "bool"
+                                             and role == "value") else "def_default"
+            elif role == "dict_value":
+                if where == "class":
+                    op = ("arg_types" if kind == "bool" and info.get("name") == "arg_types"
+                          and in_dict is root else "cls_dict_value")
+                else:
+                    op = "mod_dict_value"
+            else:
+                op = "cls_const" if where == "class" else "mod_const"
+            alts: list[str] = []
+            if kind == "bool":
+                alts.append(str(not v))
+            elif kind == "int":
+                m = re.fullmatch(r"0[xX]([0-9a-fA-F]+)|[0-9]+", old)
+                if m:
+                    news = [1] if v == 0 else [v - 1, v + 1]
+                    if m.group(1):
+                        d = m.group(1)
+                        alts += [old[:2] + format(n, "X" if d.upper() == d else "x").zfill(len(d)) for n in news]
+                    else:
+                        alts += [str(n) for n in news]
+            elif kind == "str":
+                alts += _str_alternatives(src, node, f"{src.rel}:{s}")
+            # None <-> literal, only where the annotation or a same-named
+            # assignment elsewhere says the other value is valid
+            if role == "value" and op != "arg_types":
+                if ctx == "default":
+                    kinds = {k: None for k in _ann_kinds(info.get("ann"))}
+                else:
+                    kinds = dict(name_kinds.get(info.get("name") or "", {}))
+                    for k in _ann_kinds(info.get("ann")):
+                        kinds.setdefault(k, None)
+                if kind == "none":
+                    for k in ("bool", "int", "str"):
+                        if k in kinds:
+                            alts += {"bool": ["True", "False"], "int": ["0", "1"],
+                                     "str": [kinds[k] or '""']}[k]
+                elif "none" in kinds:
+                    alts.append("None")
+            alts = [a for a in dict.fromkeys(alts) if a != old]
+            if alts:
+                out[op].append((f"L{node.lineno} {label} {old[:40]}", [[(s, e, a)] for a in alts]))
+        # neighbour swaps of dict values (non-literal values included)
+        for d in ast.walk(root):
+            if not isinstance(d, ast.Dict) or id(d) in seen_dicts or ctx != "stmt":
+                continue
+            seen_dicts.add(id(d))
+            if any(isinstance(p, ast.Lambda) for p in _parents_upto(root, d)):
+                continue
+            entries = [v for k, v in zip(d.keys, d.values) if k is not None]
+            spans = [(src.aoff(v.lineno, v.col_offset), src.aoff(v.end_lineno, v.end_col_offset)) for v in entries]
+            op = "cls_dict_swap" if where == "class" else "mod_dict_value"
+            for i, (a0, a1) in enumerate(spans):
+                at = src.text[a0:a1]
+                if "\n" in at:
+                    continue
+                choices = []
+                for j in (i - 2, i - 1, i + 1, i + 2):
+                    if 0 <= j < len(spans):
+                        b0, b1 = spans[j]
+                        bt = src.text[b0:b1]
+                        if bt != at and "\n" not in bt:
+                            choices.append([(a0, a1, bt), (b0, b1, at)])
+                if choices:
+                    out[op].append((f"L{entries[i].lineno} {label} swap {at[:30]}", choices))
+    return out
+
+
+def _parents_upto(root: ast.AST, target: ast.AST) -> list[ast.AST]:
+    """Ancestors of target below root (root included), or [] if not found."""
+    path: list[ast.AST] = []
+
+    def dfs(n):
+        if n is target:
+            return True
+        path.append(n)
+        for c in ast.iter_child_nodes(n):
+            if dfs(c):
+                return True
+        path.pop()
+        return False
+
+    return path if dfs(root) else []
+
+
+def name_kinds_of(sources: list[Source]) -> dict[str, dict[str, str]]:
+    """{name: {kind: first literal text}} over class/module-level `NAME = literal`
+    (and annotation kinds of `NAME: ann = ...`), in sorted file order."""
+    out: dict[str, dict[str, str]] = {}
+    for src in sources:
+        try:
+            roots = list(import_time_roots(src.tree))
+        except SyntaxError:
+            continue
+        for where, ctx, root, info in roots:
+            name = info.get("name")
+            if ctx != "stmt" or not name or not info.get("value"):
+                continue
+            d = out.setdefault(name, {})
+            for k in _ann_kinds(info.get("ann")):
+                d.setdefault(k, None)
+            if isinstance(root, ast.Constant) and _const_kind(root.value):
+                kind = _const_kind(root.value)
+                s = src.aoff(root.lineno, root.col_offset)
+                e = src.aoff(root.end_lineno, root.end_col_offset)
+                text = src.text[s:e]
+                if d.get(kind) is None and "\n" not in text:
+                    d[kind] = text
+    return out
+
+
 # ---------------------------------------------------------------- generator
 
 
@@ -552,10 +960,77 @@ class Generator:
         if style == "t_semicolon":
             files = self.opt_fixtures + [f for f in self.other_fixtures if f.endswith(".sql")]
             return "fixture", [self.fixture_part(files, semicolon=True)], {"lot": "semicolon"}
+        # ---- import-time state (see state_sites)
+        if style in ("s_lazy", "s_collected"):
+            group = style[2:]
+            p = self.state_part(self.state_files(group), group)
+            return "code", [p], {"lot": "state", "import_group": group}
         # ---- out of distribution
         if style.startswith("o_"):
             return "ood", self.ood_parts(style[2:]), {"lot": style[2:]}
         raise ValueError(style)
+
+    def state_files(self, group: str) -> list[str]:
+        """sqlglot files whose module pytest collection imports ('collected') or
+        not ('lazy'), from data/collection_modules.json (mutate.py collected)."""
+        if not hasattr(self, "_groups"):
+            path = COLLECTION_MODULES
+            if not path.exists():
+                raise SystemExit(f"{path} missing; run `mutate.py collected` first")
+            data = json.loads(path.read_text("utf-8"))
+            known = set(self.py_files)
+            self._groups = {g: [f for f in data[g] if f in known] for g in ("lazy", "collected")}
+        return self._groups[group]
+
+    def state_sites(self, rel: str) -> dict[str, list]:
+        key = (rel, "state")
+        if key not in self.site_cache:
+            if not hasattr(self, "_name_kinds"):
+                self._name_kinds = name_kinds_of([self.src(f) for f in self.py_files])
+            try:
+                found = state_sites(self.src(rel), self._name_kinds)
+            except (SyntaxError, tokenize.TokenError):
+                found = {}
+            self.site_cache[key] = found
+        return self.site_cache[key]
+
+    def state_part(self, files: list[str], group: str = "") -> dict:
+        """One import-time constant edit in files. Operator shares follow STATE_OPS,
+        scaled down when files hold fewer than 40 sites of it; the first try takes
+        the operator furthest below its share in this group (stratified), retries
+        draw at random. Then half the time a uniform file and site, half a uniform
+        site. A site is used once per set."""
+        used = self.__dict__.setdefault("_used_state_sites", set())
+        made = self.__dict__.setdefault("_state_ops_made", {}).setdefault(group, {})
+        counts = {op: sum(len(self.state_sites(rel).get(op, [])) for rel in files) for op in STATE_OPS}
+        weights = {op: w * min(1.0, counts[op] / 40) for op, w in STATE_OPS.items() if counts[op]}
+        if not weights:
+            raise Skip("no import-time state site")
+        total, n = sum(weights.values()), sum(made.values()) + 1
+        due = max(weights, key=lambda op: weights[op] / total * n - made.get(op, 0))
+        for attempt in range(60):
+            op = due if attempt == 0 else self.pick_weighted(weights)
+            per_file = [(rel, [s for s in self.state_sites(rel).get(op, []) if (rel, s[0]) not in used])
+                        for rel in files]
+            per_file = [(rel, sites) for rel, sites in per_file if sites]
+            if not per_file:
+                continue
+            if self.rng.random() < 0.5:
+                rel, sites = self.rng.choice(per_file)
+                desc, choices = self.rng.choice(sites)
+            else:
+                rel, (desc, choices) = self.rng.choice([(r, s) for r, ss in per_file for s in ss])
+            edits = self.rng.choice(choices)
+            src = self.src(rel)
+            new = apply_edits(src.text, edits)
+            if new == src.text or not compiles(new, rel):
+                continue
+            used.add((rel, desc))
+            made[op] = made.get(op, 0) + 1
+            change =" / ".join(f"{src.text[s:e][:30]!r}->{n[:30]!r}" for s, e, n in edits)
+            return {"file": rel, "operator": op, "edits": edits, "desc": f"{desc} : {change}",
+                    "line": src.text.count("\n", 0, edits[0][0]) + 1}
+        raise Skip("no import-time state site")
 
     def dialect_metaclass_lines(self) -> tuple[int, int]:
         src = self.src("sqlglot/dialects/dialect.py")
@@ -837,6 +1312,7 @@ MIXES = {
     "ood": {"o_multiline": 15, "o_func_add": 7, "o_func_remove": 8, "o_func_rename": 6,
             "o_func_rename_callers": 5, "o_import_add": 8, "o_new_file": 8, "o_delete_file": 8,
             "o_tests_edit": 15, "o_sqlglotc": 5, "o_docs": 8, "o_init": 7},
+    "state": {"s_lazy": 60, "s_collected": 40},
 }
 
 
@@ -992,6 +1468,71 @@ def cmd_copy(args) -> int:
     return 0
 
 
+_COLLECT_SCRIPT = r'''
+import importlib.util, json, pkgutil, sys
+import unittest  # first, as under pytest: sqlglot checks "unittest" in sys.modules
+unitrun_path, tests_path, root, out = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("_lab_unitrun", unitrun_path)
+ur = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ur)
+assert not [n for n in sys.modules if n.split(".")[0] == "sqlglot"]
+tests, _skipped = ur.load_tests_json(tests_path)
+state = ur.build_warm_state(tests, root)
+collected = {n: getattr(m, "__file__", None) for n, m in list(sys.modules.items())
+             if n.split(".")[0] == "sqlglot"}
+import sqlglot
+walked = ["sqlglot"] + [i.name for i in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.",
+                                                             onerror=lambda name: None)]
+with open(out, "w") as f:
+    json.dump({"collected": collected, "walked": walked, "test_modules": state.names,
+               "import_errors": sorted(state.import_errors)}, f)
+'''
+
+
+def cmd_collected(args) -> int:
+    """Which sqlglot modules pytest collection imports: in a fresh interpreter,
+    import unittest, then every test module in collection order (br/unitrun.py
+    build_warm_state on tests.json rows), and compare sys.modules with
+    pkgutil.walk_packages(sqlglot)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_path = Path(tmp) / "raw.json"
+        r = subprocess.run(
+            [sys.executable, "-I", "-c", _COLLECT_SCRIPT, str(args.unitrun), str(args.tests),
+             str(PRISTINE), str(raw_path)],
+            cwd=tmp, capture_output=True, text=True, env=dict(os.environ, SKIP_INTEGRATION="0"),
+        )
+        if r.returncode or not raw_path.exists():
+            print(r.stderr[-4000:], file=sys.stderr)
+            return 1
+        raw = json.loads(raw_path.read_text("utf-8"))
+    bad = {n: f for n, f in raw["collected"].items()
+           if f and not f.startswith(str(PRISTINE / "sqlglot") + "/")}
+    if bad:
+        print(f"sqlglot modules not loaded from {PRISTINE}: {bad}", file=sys.stderr)
+        return 1
+    walked = set(raw["walked"])
+    files = sorted(str(p.relative_to(PRISTINE)) for p in (PRISTINE / "sqlglot").rglob("*.py"))
+
+    def modname(rel: str) -> str:
+        name = rel[:-3].replace("/", ".")
+        return name[: -len(".__init__")] if name.endswith(".__init__") else name
+
+    out = {
+        "method": "python -I: import unittest; br.unitrun.build_warm_state(tests.json rows, "
+                  "/opt/sqlglot); sqlglot modules in sys.modules = collected, other files = lazy",
+        "tests_json": str(args.tests),
+        "test_modules": len(raw["test_modules"]),
+        "import_errors": raw["import_errors"],
+        "collected": [f for f in files if modname(f) in raw["collected"]],
+        "lazy": [f for f in files if modname(f) not in raw["collected"]],
+        "not_walked": [f for f in files if modname(f) not in walked],
+        "walked_not_files": sorted(walked - {modname(f) for f in files}),
+    }
+    write_atomic(args.out, (json.dumps(out, indent=1) + "\n").encode())
+    print(json.dumps({k: (len(v) if isinstance(v, list) else v) for k, v in out.items() if k != "method"}))
+    return 0
+
+
 def cmd_selftest(args) -> int:
     """Apply each sample patch and regenerate it: must be byte-identical."""
     tree = fresh_tree()
@@ -1033,8 +1574,13 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--corpus", type=Path, default=Path("/lab/corpus"))
     s = sub.add_parser("selftest")
     s.add_argument("--src", required=True)
+    m = sub.add_parser("collected")
+    m.add_argument("--unitrun", type=Path, default=Path("/br/unitrun.py"))
+    m.add_argument("--tests", type=Path, default=Path(__file__).resolve().parent / "data" / "tests.json")
+    m.add_argument("--out", type=Path, default=COLLECTION_MODULES)
     args = ap.parse_args(argv)
-    return {"gen": cmd_gen, "copy": cmd_copy, "selftest": cmd_selftest}[args.cmd](args)
+    return {"gen": cmd_gen, "copy": cmd_copy, "selftest": cmd_selftest,
+            "collected": cmd_collected}[args.cmd](args)
 
 
 if __name__ == "__main__":
