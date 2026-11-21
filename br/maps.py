@@ -40,6 +40,8 @@ class Maps:
         self.subprocs: int = index["subprocs"]
         self.cpu = index.get("cpu")  # per test: CPU seconds of one isolated run here, or None
         self._tokens_at = index.get("tokens_blob")
+        self._index_names_at = index.get("names_blob")
+        self._names = None
         self._blocks: dict = {}
         self._tokens = None
         self._cov = None
@@ -98,6 +100,14 @@ class Maps:
                 break
             directory = os.path.dirname(directory)
         return out
+
+    def name_readers(self, name: str) -> int:
+        """Tests that ran a code object naming `name` (attribute, global or string constant)."""
+        if self._names is None:
+            at = self._index_names_at
+            self._names = marshal.loads(self._read(*at)) if at else {"names": {}, "sets": []}
+        i = self._names["names"].get(name)
+        return 0 if i is None else self._names["sets"][i]
 
     def tokens(self) -> frozenset:
         if self._tokens is None:

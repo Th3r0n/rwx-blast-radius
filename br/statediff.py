@@ -83,6 +83,10 @@ class Describer:
         if isinstance(value, enum.Enum):
             return ("enum", type(value).__module__, type(value).__qualname__, value.name, self(value._value_, depth))
         if kind in (tuple, list) or isinstance(value, (tuple, list)):
+            if value and all(isinstance(v, type) for v in value):
+                # Sequences of classes are isinstance/issubclass tuples in
+                # sqlglot, often built from sets (address-dependent order).
+                return (kind.__name__, "classes", tuple(sorted(f"{v.__module__}:{v.__qualname__}" for v in value)))
             return (kind.__name__, tuple(self(v, depth) for v in value))
         if isinstance(value, dict):
             items = sorted((repr(self(k, depth)), self(v, depth)) for k, v in value.items())

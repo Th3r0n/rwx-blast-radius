@@ -166,6 +166,49 @@ def main():
         files[f] = (len(blob), len(data))
         blob += data
 
+    # Name index: tests that ran a code object naming an identifier (in
+    # co_names, as an identifier-like string constant, or a local of it).
+    import types as _types
+    ident = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    name_bits = defaultdict(int)
+    for f, per_code in codes.items():
+        full = os.path.join(args.root, f)
+        if not f.endswith(".py") or not os.path.exists(full):
+            continue
+        try:
+            top = compile(open(full, "rb").read(), full, "exec", dont_inherit=True)
+        except SyntaxError:
+            continue
+        stack = [top]
+        while stack:
+            co = stack.pop()
+            bits_here = per_code.get((co.co_qualname, co.co_firstlineno), 0)
+            for c in co.co_consts:
+                if isinstance(c, _types.CodeType):
+                    stack.append(c)
+                elif isinstance(c, str) and ident.match(c) and bits_here:
+                    name_bits[c] |= bits_here
+                elif isinstance(c, tuple) and bits_here:
+                    for x in c:
+                        if isinstance(x, str) and ident.match(x):
+                            name_bits[x] |= bits_here
+            if bits_here:
+                for nm in co.co_names:
+                    name_bits[nm] |= bits_here
+    uniq = {}
+    nsets = []
+    names = {}
+    for nm, v in name_bits.items():
+        i = uniq.get(v)
+        if i is None:
+            i = uniq[v] = len(nsets)
+            nsets.append(v)
+        names[nm] = i
+    nb = zlib.compress(marshal.dumps({"names": names, "sets": nsets}), 9)
+    names_at = (len(blob), len(nb))
+    blob += nb
+    print(f"name index: {len(names)} names, {len(nsets)} distinct sets, {len(nb)/1e6:.2f} MB")
+
     tokens = set()
     for top in SOURCE_DIRS:
         for dirpath, _, names in os.walk(os.path.join(args.root, top)):
@@ -202,6 +245,7 @@ def main():
         "lists": dict(lists),
         "subprocs": subprocs,
         "tokens_blob": tokens_at,
+        "names_blob": names_at,
     }
     with open(os.path.join(args.out, "cov.bin"), "wb") as f:
         f.write(blob)

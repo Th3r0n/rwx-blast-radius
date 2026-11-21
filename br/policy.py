@@ -66,6 +66,8 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
         chosen = answers[cid]
         if not chosen or res.all or not _hot_eligible(res, maps):
             continue
+        if not res.changes and res.data_changes:
+            continue  # only fixture entries changed: their readers almost always fail
         light = [n for n in chosen if n not in never]
         if not light:
             continue
@@ -108,4 +110,183 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
             f"verified {len(light)}: {len(failing)} fail, {len(unverified)} unverified, kept {len(keep)};"
             f" child cpu {info.get('cpu', 0):.2f}s wall {time.monotonic() - t0:.2f}s"
             f" proof={info.get('proof')} err={info.get('error')}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Clean mode: import-time changes in modules loaded during collection.
+
+
+def _load_attrs(maps_dir):
+    import marshal
+
+    path = os.path.join(maps_dir, "attrs.marshal")
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return marshal.load(f)
+
+
+def _subclass_ids(class_id):
+    """Ids (statediff naming) of the class and its live subclasses, in this process."""
+    import sys
+
+    mod, _, qual = class_id.partition(":")
+    qual = qual.split("#", 1)[0]
+    obj = sys.modules.get(mod)
+    for part in qual.split("."):
+        obj = getattr(obj, part, None) if obj is not None else None
+    if not isinstance(obj, type):
+        return None
+    out = set()
+    stack = [obj]
+    while stack:
+        c = stack.pop()
+        cid = f"{c.__module__}:{c.__qualname__}"
+        if cid in out:
+            continue
+        out.add(cid)
+        try:
+            stack.extend(type.__subclasses__(c))
+        except Exception:
+            pass
+    return out
+
+
+def cell_readers(cells, maps, attrs, pristine_cells, funcs=None):
+    """Bitset of tests that can observe the changed cells, or None (= every test)."""
+    bits = 0
+    sets = attrs["sets"] if attrs else None
+    funcs = funcs or {}
+    for cell in cells:
+        kind = cell[0]
+        if cell in funcs:
+            where = funcs[cell]
+            if where is None:
+                bits |= maps.name_readers(cell[2])
+                continue
+            path, qual, line = where
+            # Changed defaults/decorators are seen only by running it; a
+            # function that was swapped for another one is seen by its callers,
+            # who ran the pinned one.
+            bits |= maps.code_tests(path, (qual, line))
+            if cell not in pristine_cells:
+                bits |= maps.name_readers(cell[2])
+            continue
+        if kind in ("g", "gk"):
+            bits |= maps.name_readers(cell[2])
+            continue
+        if kind not in ("c", "ck") or attrs is None:
+            return None
+        cid, attr = cell[1], cell[2]
+        subs = _subclass_ids(cid)
+        if subs is None:
+            return None
+        if kind == "c" and cell not in pristine_cells:
+            # A new attribute: lookups that used to fail or resolve elsewhere.
+            bits |= maps.name_readers(attr)
+        i = attrs["owner"].get((cid, attr))
+        if i is not None:
+            bits |= sets[i]
+        for sub in subs:
+            i = attrs["via"].get((sub, attr))
+            if i is not None:
+                bits |= sets[i]
+        if kind == "ck":
+            i = attrs["keys"].get((cid, attr, cell[3]))
+            if i is not None:
+                bits |= sets[i]
+            i = attrs["allkeys"].get((cid, attr))
+            if i is not None:
+                bits |= sets[i]
+        else:
+            i = attrs["allkeys"].get((cid, attr))
+            if i is not None:
+                bits |= sets[i]
+    return bits
+
+
+def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, maps_dir, state_path):
+    """Clean jobs run before the warm state exists in this process (they fork from it bare)."""
+    import marshal
+    import sys
+
+    if "sqlglot" in sys.modules or not os.path.exists(state_path):
+        return
+    jobs = [cid for cid, res in statics.items() if res.clean and not getattr(res, "hard", False)]
+    if not jobs:
+        return
+    with open(state_path, "rb") as f:
+        pristine = marshal.load(f)
+    attrs = _load_attrs(maps_dir)
+    factor = float(os.environ.get("BR_CPU_FACTOR", "2.5"))
+    rows = {t["number"]: t for t in tests}
+    bit_numbers = [number_of.get(test_id) for test_id in maps.tests]
+    est = {}
+    if maps.cpu:
+        for i, n in enumerate(bit_numbers):
+            if n is not None:
+                est[n] = maps.cpu[i]
+    never = set()
+    for t in tests:
+        if t["file"] == "tests/test_executor.py" or ms[t["number"]] >= HEAVY_MS:
+            never.add(t["number"])
+    b, i = maps.subprocs, 0
+    while b:
+        if b & 1 and bit_numbers[i] is not None:
+            never.add(bit_numbers[i])
+        b >>= 1
+        i += 1
+    every = sorted(ms)
+
+    for cid in sorted(jobs):
+        if time.monotonic() > deadline:
+            break
+        res = statics[cid]
+        base_bits = res.bits
+
+        def choose(cells, import_errors, funcs=None, base_bits=base_bits):
+            if import_errors:
+                return [], every
+            readers = cell_readers(cells, maps, attrs, pristine["cells"], funcs)
+            if readers is None:
+                return [], every
+            bits = readers | base_bits
+            chosen, k = set(), 0
+            while bits:
+                if bits & 1 and bit_numbers[k] is not None:
+                    chosen.add(bit_numbers[k])
+                bits >>= 1
+                k += 1
+            light = sorted(n for n in chosen if n not in never)
+            keep = sorted(n for n in chosen if n in never)
+            gain = _cost(sorted(chosen), ms) - _cost(keep, ms)
+            cpu = sum(est.get(n, ms[n] / 1000.0) for n in light) * factor
+            if not light or cpu * 1000 > SAFETY * gain:
+                return [], sorted(chosen)
+            return [rows[n] for n in light], keep
+
+        job = verify.Job(
+            cid,
+            [],
+            dict(res.py_files),
+            {path: new for path, _old, new in res.data_changes},
+            cpu_limit=30.0,
+            wall_limit=40.0,
+        )
+        t0 = time.monotonic()
+        verdicts, info = verify.run_clean_job(tests, job, pristine, choose)
+        keep = info.get("keep")
+        if not info.get("proof") or keep is None:
+            log(cid, "clean job gave no proof; keeping ALL:", info.get("error"), "timeout" if info.get("timeout") else "")
+            continue
+        ran = info.get("run") or []
+        # Failing, and anything that was to run but got no verdict, stays selected.
+        failing = [n for n in ran if verdicts.get(rows[n]["id"]) not in ("pass", "skip")]
+        answers[cid] = sorted(set(keep) | set(failing))
+        log(
+            cid,
+            f"clean: {info.get('proof', {}).get('cells')} changed cells, kept {len(keep)}, ran {len(ran)},"
+            f" {len(failing)} fail; child cpu {info.get('cpu', 0):.2f}s wall {time.monotonic() - t0:.2f}s;"
+            f" cells {str(info.get('cells'))[:300]}",
         )

@@ -26,6 +26,9 @@ class Result:
         self.changes: list = []  # (path, codediff.Change) for later stages
         self.data_changes: list = []  # (path, old, new)
         self.py_files: dict = {}  # path -> (old_bytes, new_bytes)
+        # Import-time changes in modules loaded during collection: the static
+        # answer is ALL; a clean import of the patched tree may narrow it.
+        self.clean: list = []
 
     def add(self, bits: int, why: str):
         if bits:
@@ -34,6 +37,7 @@ class Result:
 
     def widen(self, why: str):
         self.all = True
+        self.hard = getattr(self, "hard", False) or not why.startswith(("import-time change in preloaded", "function that runs at import"))
         self.reasons.append("ALL: " + why)
 
 
@@ -74,7 +78,7 @@ class StaticSelector:
             res.widen("empty patch")
             return res
         for fp in filepatches:
-            if res.all:
+            if res.all and not res.clean:
                 break
             try:
                 self._file(fp, res)
@@ -167,12 +171,17 @@ class StaticSelector:
         for change in changes:
             if change.import_time or change.kind != "function":
                 if preloaded:
-                    return res.widen(f"import-time change in preloaded module {path}:{change.key}")
+                    res.clean.append((path, change))
+                    res.widen(f"import-time change in preloaded module {path}:{change.key}")
+                    continue
                 # Lazily imported module: only tests that imported or ran it.
                 res.add(self.maps.file_tests(path), f"import-time change in lazy module {path}")
                 continue
             if change.key in preload:
-                return res.widen(f"function that runs at import time {path}:{change.key}")
+                # It ran while the test modules were imported (state built
+                # then may differ) AND tests call it later: both effects count.
+                res.clean.append((path, change))
+                res.widen(f"function that runs at import time {path}:{change.key}")
             self._runtime(path, change, res)
         return None
 

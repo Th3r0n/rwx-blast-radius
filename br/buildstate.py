@@ -36,6 +36,9 @@ def child(out, root, maps_dir, unordered_path=None):
     if unordered_path:
         with open(unordered_path, "rb") as f:
             unordered = frozenset(marshal.load(f))
+    import gc
+
+    gc.collect()
     snap = statediff.snapshot([m for m in sys.modules if m.startswith("sqlglot")], unordered=unordered)
     with open(out, "wb") as f:
         marshal.dump(snap, f)

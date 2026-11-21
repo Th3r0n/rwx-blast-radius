@@ -1,0 +1,457 @@
+"""Item slices: prove a loop-over-fixture test passing by running only the items a patch reaches.
+
+Some expensive tests loop over the entries ("items") of one fixture file: TPC-H/TPC-DS
+queries (tests/test_executor.py), optimizer fixture pairs (TestOptimizer.check_file,
+test_annotate_types, test_annotate_funcs). lab/trace/slices_trace.py ran each such
+test T at the pinned commit once per item (T restricted to that single item, forked
+from the warm state) and once with zero items, under the tracer's coverage recording.
+lab/build_slices.py stored the result in maps/slices.marshal:
+
+  {"version": 1, "tests": {test_id: entry}}
+  entry:
+    module, cls, method      where the test lives
+    sources   [(kind, name, loader, file, n, offset), ...]  what T loops over:
+              kind "call": T calls module.<name>(file) (name == loader) while it runs;
+              kind "attr": setUpClass stored list(<loader>(file)) as cls.<name> and T
+              reads self.<name>. Items of a source are numbered offset .. offset+n-1
+              in yield order; `loader` is load_sql_fixture_pairs or load_sql_fixtures.
+    n         number of items (all sources)
+    opens     files T opened as data (not through the import system) in any run
+    cpu_base  CPU seconds of T with zero items in a forked child (no tracing)
+    cpu_items per item: CPU seconds T needs on top of cpu_base for that item
+    seconds   recorded duration of the full test (tests.json)
+    cov       zlib(marshal({"sets": [bitset, ...], "files": {path: {"c": {(qualname,
+              firstlineno): sid}, "l": {(qualname, firstlineno): {line: sid}}}}}))
+              sid indexes "sets" (bit i = item i ran it); sid -1 = "common": T ran it
+              outside any single item (class setup, loop scaffolding, or only when
+              several items run in sequence) - touching it affects every item.
+    rest      same layout for test_execute_tpcds only: coverage outside the "front"
+              phase (parse_one + pickling in the main process, executor.optimize in the
+              worker), see front_equal(); None otherwise.
+
+Soundness model: a patch whose changed code objects/lines are not in T's common
+coverage reaches item i only if item i ran a changed line (or started a code object
+that changed structurally). The unaffected items run exactly the pristine code, and
+every item passes at the pinned commit (checked by the build). Running T on the
+affected items alone with the patch active therefore decides T's verdict, up to one
+accepted gap: patched code run by an affected item that leaves different shared state
+behind (a cache entry, a mutated module global) read by an unaffected item later in the
+full run. Everything not understood returns None (= run the whole test).
+
+Runtime use (all stdlib):
+    smap = SliceMap(path)                       # or load_default()
+    items = affected(smap, test_id, res.changes, res.data_changes)
+    None -> run T normally; [] -> T passes without running (if T is a candidate only
+    because of the patch); else, in the verification child, before run_tests():
+    install_filter(test_id, items, smap) and run T normally: it sees only those items.
+"""
+
+from __future__ import annotations
+
+import functools
+import importlib
+import marshal
+import os
+import sys
+import zlib
+
+from . import fixtures as _fixtures
+
+__all__ = [
+    "SliceMap",
+    "load_default",
+    "affected",
+    "affected_split",
+    "install_filter",
+    "uninstall_filters",
+    "duckdb_single_thread",
+    "estimate_cpu",
+    "front_equal",
+    "build_front",
+]
+
+LOADERS = ("load_sql_fixture_pairs", "load_sql_fixtures")
+COMMON = -1
+DEFAULT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps", "slices.marshal")
+
+
+class SliceTest:
+    """One sliceable test of the map (coverage decompressed on first use)."""
+
+    def __init__(self, test_id, entry):
+        self.id = test_id
+        self.module = entry["module"]
+        self.cls = entry["cls"]
+        self.method = entry["method"]
+        self.sources = [tuple(s) for s in entry["sources"]]
+        self.n = entry["n"]
+        self.opens = frozenset(entry.get("opens", ()))
+        self.cpu_base = entry.get("cpu_base")
+        self.cpu_items = entry.get("cpu_items")
+        self.seconds = entry.get("seconds")
+        self._blobs = {"cov": entry.get("cov"), "rest": entry.get("rest")}
+        self._cache = {}
+
+    def coverage(self, which="cov"):
+        if which not in self._cache:
+            blob = self._blobs.get(which)
+            self._cache[which] = None if blob is None else marshal.loads(zlib.decompress(blob))
+        return self._cache[which]
+
+    def fixture_paths(self):
+        """{repo path of a looped fixture: [source, ...]}."""
+        out = {}
+        for src in self.sources:
+            out.setdefault("tests/fixtures/" + src[3], []).append(src)
+        return out
+
+
+class SliceMap:
+    def __init__(self, path=DEFAULT_PATH):
+        with open(path, "rb") as f:
+            data = marshal.load(f)
+        if data.get("version") != 1:
+            raise ValueError(f"unsupported slices map version {data.get('version')!r}")
+        self.path = path
+        self._raw = data["tests"]
+        self._tests = {}
+
+    def __contains__(self, test_id):
+        return test_id in self._raw
+
+    def ids(self):
+        return sorted(self._raw)
+
+    def get(self, test_id):
+        t = self._tests.get(test_id)
+        if t is None and test_id in self._raw:
+            t = self._tests[test_id] = SliceTest(test_id, self._raw[test_id])
+        return t
+
+
+_default = []
+
+
+def load_default():
+    """The map next to br/ (maps/slices.marshal) or $BR_SLICES; None if absent."""
+    if not _default:
+        path = os.environ.get("BR_SLICES") or DEFAULT_PATH
+        try:
+            _default.append(SliceMap(path))
+        except (OSError, ValueError, EOFError, TypeError):
+            _default.append(None)
+    return _default[0]
+
+
+# ---------------------------------------------------------------------------
+# Which items a patch reaches
+
+
+def _bits_to_list(bits):
+    out = []
+    i = 0
+    while bits:
+        if bits & 1:
+            out.append(i)
+        bits >>= 1
+        i += 1
+    return out
+
+
+def _code_items(cov, path, change):
+    """Bitset of items that ran the change, or None if common coverage is touched."""
+    block = cov["files"].get(path)
+    if block is None:
+        return 0  # T never ran any code of this file
+    sets = cov["sets"]
+    key = (change.code.co_qualname, change.code.co_firstlineno)
+    lines = block["l"].get(key)
+    out = 0
+    if change.whole:
+        sid = block["c"].get(key)
+        if sid is not None:
+            if sid == COMMON:
+                return None
+            out |= sets[sid]
+        if lines:
+            for sid in lines.values():
+                if sid == COMMON:
+                    return None
+                out |= sets[sid]
+        return out
+    if not lines:
+        return 0
+    for line in change.lines:
+        sid = lines.get(line)
+        if sid is None:
+            continue
+        if sid == COMMON:
+            return None
+        out |= sets[sid]
+    return out
+
+
+def _changed_entries(loader, old, new):
+    """Changed 0-based entry indexes of a fixture for `loader`, or None (not alignable)."""
+    if loader == "load_sql_fixture_pairs":
+        return _fixtures.changed_pair_indexes(old, new)
+    if loader == "load_sql_fixtures":
+        try:
+            a = _fixtures.fixtures(old)
+            b = _fixtures.fixtures(new)
+        except _fixtures.FixtureDecodeError:
+            return None
+        if len(a) != len(b):
+            return None
+        return [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+    return None
+
+
+def _affected_bits(t, changes, data_changes, which):
+    cov = t.coverage(which)
+    if cov is None:
+        return None
+    bits = 0
+    for path, change in changes:
+        if change.import_time:
+            return None  # module/class body: cannot be reasoned about per item
+        if path in t.opens:
+            return None  # T reads the changed source as data
+        got = _code_items(cov, path, change)
+        if got is None:
+            return None
+        bits |= got
+    fixture_paths = t.fixture_paths()
+    for entry in data_changes or ():
+        path, old, new = entry[0], entry[1], entry[2]
+        srcs = fixture_paths.get(path)
+        if srcs is None:
+            if path in t.opens:
+                return None  # some other file T reads
+            continue
+        if old is None or new is None:
+            return None
+        for src in srcs:
+            idx = _changed_entries(src[2], old, new)
+            if idx is None:
+                return None
+            n, offset = src[4], src[5]
+            for i in idx:
+                if not 0 <= i < n:
+                    return None
+                bits |= 1 << (offset + i)
+    return bits
+
+
+def affected(slice_map, test_id, changes, data_changes=None):
+    """Sorted item indexes of test_id that the patch can reach, or None (run all of T).
+
+    changes: [(path, codediff.Change)] of the patch (static.Result.changes).
+    data_changes: [(path, old_bytes, new_bytes)] (static.Result.data_changes); a
+    looped fixture contributes its changed entries, any other file T opened as data
+    returns None. The caller must not slice when the patch creates, deletes or
+    renames files, or when the static stage widened to ALL.
+    """
+    t = slice_map.get(test_id) if slice_map is not None else None
+    if t is None:
+        return None
+    try:
+        bits = _affected_bits(t, changes, data_changes, "cov")
+    except Exception:  # an analysis bug must never drop a test
+        return None
+    if bits is None:
+        return None
+    if bits >> t.n:
+        return None  # map inconsistency
+    return _bits_to_list(bits)
+
+
+def affected_split(slice_map, test_id, changes, data_changes=None):
+    """(affected, rest_affected) for a test with a front/rest split (else rest = affected).
+
+    rest_affected: the items whose non-front coverage the patch reaches; items in
+    affected but not in rest_affected may be dropped when front_equal() says their
+    front output is unchanged. (None, None) when T cannot be sliced.
+    """
+    items = affected(slice_map, test_id, changes, data_changes)
+    if items is None:
+        return None, None
+    t = slice_map.get(test_id)
+    if t.coverage("rest") is None:
+        return items, items
+    try:
+        bits = _affected_bits(t, changes, data_changes, "rest")
+    except Exception:
+        return items, items
+    if bits is None:
+        return items, items
+    rest = _bits_to_list(bits)
+    return items, sorted(set(rest) & set(items)) if items is not None else rest
+
+
+def estimate_cpu(slice_map, test_id, items):
+    """Estimated child CPU seconds (no tracing) of T restricted to items, or None."""
+    t = slice_map.get(test_id)
+    if t is None or t.cpu_base is None or t.cpu_items is None:
+        return None
+    return t.cpu_base + sum(t.cpu_items[i] for i in items)
+
+
+# ---------------------------------------------------------------------------
+# Running T on a subset of its items (inside a verification child)
+
+_installed = []  # (owner, name, previous value)
+
+
+def _spec_of(test_id, slice_map, spec):
+    if spec is not None:
+        return spec
+    smap = slice_map if slice_map is not None else load_default()
+    t = smap.get(test_id) if smap is not None else None
+    if t is None:
+        raise KeyError(f"no slice map entry for {test_id}")
+    return {"module": t.module, "cls": t.cls, "method": t.method, "sources": t.sources, "n": t.n}
+
+
+def install_filter(test_id, items, slice_map=None, spec=None):
+    """Makes test_id iterate only over `items` (global item indexes) when it runs.
+
+    Replaces the test method on its class by a wrapper that, for the duration of each
+    call, rebinds the loader names in the test's module to a filtering generator
+    ("call" sources) and shadows the class attributes setUpClass loaded with filtered
+    copies on the instance ("attr" sources). Works whether or not setUpClass has run.
+    The filtering loader / attribute check fails the test (AssertionError) when a
+    fixture does not have the number of entries the map recorded, so a mismatch never
+    turns into a pass. Raises if the test cannot be found; the caller must then run
+    the test unfiltered or keep it selected.
+    """
+    spec = _spec_of(test_id, slice_map, spec)
+    module = sys.modules.get(spec["module"]) or importlib.import_module(spec["module"])
+    cls = getattr(module, spec["cls"])
+    name = spec["method"]
+    original = getattr(cls, name)
+    if getattr(original, "__br_slice_original__", None) is not None:
+        original = original.__br_slice_original__  # re-filtering: wrap the real method
+    wanted = sorted(set(int(i) for i in items))
+    calls = {}  # (loader name, file) -> (n, allowed local indexes)
+    attrs = []  # (attr, n, [local indexes])
+    for kind, sname, loader, file, n, offset in (tuple(s) for s in spec["sources"]):
+        local = [i - offset for i in wanted if offset <= i < offset + n]
+        if kind == "call":
+            calls[(sname, file)] = (n, frozenset(local))
+        elif kind == "attr":
+            attrs.append((sname, n, local))
+        else:
+            raise ValueError(f"unknown source kind {kind!r}")
+    outside = [i for i in wanted if not 0 <= i < spec["n"]]
+    if outside:
+        raise ValueError(f"items out of range for {test_id}: {outside[:5]}")
+    loader_names = sorted({sname for sname, _ in calls})
+
+    def make_filtered(real, lname):
+        def filtered(filename, *args, **kwargs):
+            spec_ = calls.get((lname, filename))
+            if spec_ is None:  # not a looped file: unfiltered
+                yield from real(filename, *args, **kwargs)
+                return
+            n, allowed = spec_
+            count = 0
+            for index, entry in enumerate(real(filename, *args, **kwargs)):
+                count += 1
+                if index in allowed:
+                    yield entry
+            if count != n:
+                raise AssertionError(f"br.slices: {filename} has {count} entries, the slice map {n}")
+
+        filtered.__br_slice_real__ = real
+        return filtered
+
+    @functools.wraps(original)
+    def sliced(self, *args, **kwargs):
+        saved = []
+        try:
+            for lname in loader_names:
+                real = module.__dict__[lname]
+                real = getattr(real, "__br_slice_real__", real)
+                saved.append((lname, module.__dict__[lname]))
+                setattr(module, lname, make_filtered(real, lname))
+            for attr, n, local in attrs:
+                full = getattr(type(self), attr)
+                if len(full) != n:
+                    raise AssertionError(f"br.slices: {attr} has {len(full)} entries, the slice map {n}")
+                self.__dict__[attr] = [full[i] for i in local]
+            return original(self, *args, **kwargs)
+        finally:
+            for lname, value in reversed(saved):
+                setattr(module, lname, value)
+            for attr, _n, _local in attrs:
+                self.__dict__.pop(attr, None)
+
+    sliced.__br_slice_original__ = original
+    sliced.__br_slice_items__ = tuple(wanted)
+    previous = cls.__dict__.get(name, _MISSING)
+    _installed.append((cls, name, previous))
+    setattr(cls, name, sliced)
+    return sliced
+
+
+_MISSING = object()
+
+
+def uninstall_filters():
+    while _installed:
+        owner, name, previous = _installed.pop()
+        if previous is _MISSING:
+            try:
+                delattr(owner, name)
+            except AttributeError:
+                pass
+        else:
+            setattr(owner, name, previous)
+
+
+def duckdb_single_thread():
+    """Makes later duckdb.connect() calls default to one worker thread.
+
+    duckdb starts one OS thread per core by default; a forked verification child
+    must stay within the container's process/thread limit. Results are identical
+    (checked on the pristine suite by lab/trace/slices_trace.py). Returns True when
+    patched.
+    """
+    duckdb = sys.modules.get("duckdb")
+    if duckdb is None:
+        return False
+    real = duckdb.connect
+    if getattr(real, "__br_single_thread__", False):
+        return True
+
+    @functools.wraps(real)
+    def connect(*args, **kwargs):
+        config = kwargs.get("config")
+        if len(args) >= 3:  # positional config
+            config = args[2]
+        config = dict(config or {})
+        config.setdefault("threads", 1)
+        if len(args) >= 3:
+            args = args[:2] + (config,) + args[3:]
+        else:
+            kwargs["config"] = config
+        return real(*args, **kwargs)
+
+    connect.__br_single_thread__ = True
+    duckdb.connect = connect
+    return True
+
+
+# ---------------------------------------------------------------------------
+# test_execute_tpcds: recompute the front phase (see module docstring)
+
+TPCDS_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+
+
+def front_equal(*args, **kwargs):  # pragma: no cover - replaced below when available
+    raise NotImplementedError
+
+
+def build_front(*args, **kwargs):  # pragma: no cover - replaced below when available
+    raise NotImplementedError

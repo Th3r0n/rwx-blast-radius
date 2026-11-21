@@ -90,6 +90,24 @@ def main() -> int:
         try:
             from . import policy
 
+            if os.environ.get("BR_CLEAN", "1") == "1":
+                policy.refine_clean(
+                    answers,
+                    statics,
+                    tests,
+                    ms,
+                    maps,
+                    number_of,
+                    deadline=started + float(os.environ.get("BR_DEADLINE", "110")),
+                    log=log,
+                    maps_dir=maps_dir,
+                    state_path=os.environ.get("BR_STATE", os.path.join(os.path.dirname(here), "state.marshal")),
+                )
+        except Exception as exc:  # keep the static answers
+            log("clean stage failed, keeping static answers:", repr(exc))
+        try:
+            from . import policy
+
             policy.refine(
                 answers,
                 statics,

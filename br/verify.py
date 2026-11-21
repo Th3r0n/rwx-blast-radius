@@ -378,7 +378,7 @@ def _collect(pid, r, job):
                 if "id" in msg:
                     verdicts[msg["id"]] = msg["outcome"]
                 else:
-                    for key in ("proof", "error", "keep", "cells", "served"):
+                    for key in ("proof", "error", "keep", "cells", "served", "run", "funcs"):
                         if key in msg:
                             info[key] = msg[key]
     finally:
@@ -408,6 +408,74 @@ def _limits(job):
         pass
 
 
+def _line_map(old: bytes, new: bytes):
+    """Map patched line numbers to pinned ones (None for inserted lines)."""
+    from difflib import SequenceMatcher
+
+    a = old.split(b"\n")
+    b = new.split(b"\n")
+    out = {}
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            for d in range(j2 - j1):
+                out[j1 + d + 1] = i1 + d + 1
+    return out
+
+
+def _resolve_class(class_id):
+    mod, _, qual = class_id.partition(":")
+    if "#" in qual:
+        return None
+    obj = sys.modules.get(mod)
+    for part in qual.split("."):
+        obj = getattr(obj, part, None) if obj is not None else None
+    return obj if isinstance(obj, type) else None
+
+
+def _function_cells(cells, job):
+    """{cell: (path, qualname, pinned firstlineno) or None} for cells holding functions.
+
+    A function-valued cell (method, classmethod, staticmethod, property
+    accessor, module-level function) changed by its def header (defaults,
+    decorators) is observable only by running it: its readers are the tests
+    that started the pinned code object. None means the pinned code object
+    cannot be identified (new function, line not mappable).
+    """
+    maps_ = {}
+    out = {}
+    for cell in cells:
+        if cell[0] not in ("c", "g"):
+            continue
+        if cell[0] == "c":
+            owner = _resolve_class(cell[1])
+            value = owner.__dict__.get(cell[2]) if owner is not None else None
+        else:
+            module = sys.modules.get(cell[1])
+            value = getattr(module, "__dict__", {}).get(cell[2]) if module is not None else None
+        fn = value
+        if isinstance(fn, (classmethod, staticmethod)):
+            fn = fn.__func__
+        elif isinstance(fn, property):
+            fn = fn.fget
+        while hasattr(fn, "__wrapped__"):
+            fn = fn.__wrapped__
+        if not isinstance(fn, types.FunctionType):
+            continue
+        co = fn.__code__
+        full = co.co_filename
+        if not full.startswith(ROOT + "/"):
+            out[cell] = None
+            continue
+        path = full[len(ROOT) + 1 :]
+        line = co.co_firstlineno
+        if path in job.py_files:
+            if path not in maps_:
+                maps_[path] = _line_map(*job.py_files[path])
+            line = maps_[path].get(line)
+        out[cell] = None if line is None else (path, co.co_qualname, line)
+    return out
+
+
 def _clean_child(tests_rows, job, pristine, choose, w):
     from . import statediff
 
@@ -428,6 +496,7 @@ def _clean_child(tests_rows, job, pristine, choose, w):
     for name in modules:
         if name in sys.modules and name not in finder.served:
             raise RuntimeError(f"{name} was imported without the patch")
+    gc.collect()  # dead dynamically created classes must not count as subclasses
     snap = statediff.snapshot(
         [m for m in sys.modules if m.startswith("sqlglot")], unordered=frozenset(map(tuple, pristine["unstable"]))
     )
@@ -438,8 +507,15 @@ def _clean_child(tests_rows, job, pristine, choose, w):
         if c not in chaotic or statediff.cell_module(c) in touched
     ]
     import_errors = sorted(state.import_errors)
-    to_run, to_keep = choose(cells, import_errors)
-    os.write(w, (json.dumps({"cells": [list(c) for c in cells[:200]], "keep": sorted(to_keep)}) + "\n").encode())
+    funcs = _function_cells(cells, job)
+    to_run, to_keep = choose(cells, import_errors, funcs)
+    report = {
+        "cells": [list(c) for c in cells[:5000]],
+        "keep": sorted(to_keep),
+        "run": [r["number"] for r in to_run],
+        "funcs": {repr(k): v for k, v in list(funcs.items())[:500]},
+    }
+    os.write(w, (json.dumps(report) + "\n").encode())
     from . import inlinepool
 
     inlinepool.install([m for n, m in list(sys.modules.items()) if n.startswith("tests") and m is not None])

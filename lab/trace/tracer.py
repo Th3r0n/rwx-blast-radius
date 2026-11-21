@@ -58,7 +58,9 @@ import unittest  # noqa: F401
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _REPO)
-from br import inlinepool, unitrun  # noqa: E402
+from br import inlinepool, statediff, unitrun  # noqa: E402
+
+import attrread  # noqa: E402  (lab/trace/attrread.py, imported while the script dir is on sys.path)
 
 # Keep /src (namespace packages!) and the script dir off sys.path while tests run.
 sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") not in (_REPO, _SCRIPT_DIR)]
@@ -611,17 +613,30 @@ class Server:
                 }
                 rec = dict(meta, new_modules=sorted(set(sys.modules) - mods_before))
                 rec.update(bucket.to_json())
-                path = os.path.join(self.tmp, f"{n:04d}")
-                # Body first, meta last: meta present => body complete.
-                with open(path + ".body", "w", encoding="utf-8") as f:
-                    json.dump(rec, f, separators=(",", ":"))
-                with open(path + ".meta.tmp", "w", encoding="utf-8") as f:
-                    json.dump(meta, f)
-                os.replace(path + ".meta.tmp", path + ".meta")
+                self._child_record(n, meta, rec)
 
             return body
 
         rows = []
+        on_done = self._record_on_done(rows, dict(codes=[], lines={}, opens=[], lists=[], subprocs=[],
+                                                  new_modules=[], audit_errors=0))
+
+        # Longest first, for packing.
+        order = sorted(self.selected, key=lambda t: -t.get("seconds", 0))
+        wall = self.run_children(self.args.jobs, make_body, on_done, self.timeout_of, order=order)
+        self.write_summary("isolated", rows, wall)
+
+    def _child_record(self, n, meta, rec):
+        """Child side: writes the record body, then the small meta file (commit marker)."""
+        path = os.path.join(self.tmp, f"{n:04d}")
+        with open(path + ".body", "w", encoding="utf-8") as f:
+            json.dump(rec, f, separators=(",", ":"))
+        with open(path + ".meta.tmp", "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        os.replace(path + ".meta.tmp", path + ".meta")
+
+    def _record_on_done(self, rows, empty):
+        """Parent side: splices wait4 cpu/wall into the child's record, writes NNNN.json.gz."""
 
         def on_done(entry, info):
             n = entry["number"]
@@ -654,7 +669,7 @@ class Server:
                            test_wall=meta["test_wall"], detail=meta["detail"], size=len(data))
             else:
                 rec = dict(head, outcome=outcome, phase="runner", detail=f"child {outcome} (exit {info['exit']})",
-                           codes=[], lines={}, opens=[], lists=[], subprocs=[], new_modules=[], audit_errors=0)
+                           **empty)
                 write_json(os.path.join(self.out, f"{n:04d}.json.gz"), rec, gz=True)
                 row = dict(head, outcome=outcome, phase="runner", detail=rec["detail"], size=0)
             self._keep_log(n, info["log"], outcome != "pass")
@@ -662,10 +677,57 @@ class Server:
                 log(f"#{n} {entry['id']}: {outcome}")
             rows.append(row)
 
-        # Longest first, for packing.
+        return on_done
+
+    # attribute-read pass ------------------------------------------------------------
+
+    def run_attrs(self):
+        warm = self.warm
+        root = self.root
+        t0, c0 = time.perf_counter(), self_cpu()
+        inst = attrread.Instrumenter(statediff.key_repr)
+        inst.instrument()
+        inst.install_import_hook()
+        inst.reset()
+        gc.collect()
+        gc.freeze()
+        info = {
+            "classes": len(inst.classes),
+            "duplicate_class_ids": inst.duplicates,
+            "stats": dict(inst.stats),
+            "recs": len(inst.recs),
+            "recdicts": len(inst.dicts_by_id),
+            "wall": time.perf_counter() - t0,
+            "cpu": self_cpu() - c0,
+        }
+        log(f"attrs instrumentation: {info}")
+
+        def make_body(entry):
+            def body():
+                n = entry["number"]
+                classes_before = len(inst.classes)
+                inst.reset()
+                verdicts = unitrun.run_tests([entry], root=root, warm=warm)
+                reads, keyreads, key_errors = inst.collect()
+                v = verdicts[0]
+                meta = {
+                    "outcome": v["outcome"],
+                    "phase": v["phase"],
+                    "detail": v["detail"] if v["outcome"] != "pass" else None,
+                    "test_cpu": v["cpu"],
+                    "test_wall": v["wall"],
+                }
+                rec = dict(meta, new_classes=len(inst.classes) - classes_before, key_repr_errors=key_errors,
+                           reads=reads, keyreads=keyreads)
+                self._child_record(n, meta, rec)
+
+            return body
+
+        rows = []
+        on_done = self._record_on_done(rows, dict(new_classes=0, key_repr_errors=0, reads=[], keyreads=[]))
         order = sorted(self.selected, key=lambda t: -t.get("seconds", 0))
         wall = self.run_children(self.args.jobs, make_body, on_done, self.timeout_of, order=order)
-        self.write_summary("isolated", rows, wall)
+        self.write_summary("attrs", rows, wall, extra={"instrumentation": info})
 
     # in-order pass ------------------------------------------------------------------
 
@@ -913,7 +975,7 @@ def main(argv=None):
     p.add_argument("--tests", required=True)
     p.add_argument("--root", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--pass", dest="mode", required=True, choices=["isolated", "inorder", "calib"])
+    p.add_argument("--pass", dest="mode", required=True, choices=["isolated", "inorder", "calib", "attrs"])
     p.add_argument("--jobs", type=int, default=7)
     p.add_argument("--only", help="test numbers, e.g. 1,5,10-20")
     p.add_argument("--limit", type=int)
@@ -929,6 +991,8 @@ def main(argv=None):
         server.run_isolated()
     elif args.mode == "inorder":
         server.run_inorder()
+    elif args.mode == "attrs":
+        server.run_attrs()
     else:
         server.run_calib()
     try:
