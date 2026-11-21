@@ -55,6 +55,20 @@ def compile_bytes(data: bytes, filename: str):
 
 
 _pinned_cache: dict = {}
+_patched_cache: dict = {}
+_diff_cache: dict = {}
+
+
+def patched_code(data: bytes, filename: str):
+    """compile_bytes, memoised by file name and content (forked children reuse what
+    the parent compiled during the static stage)."""
+    import hashlib
+
+    key = (filename, len(data), hashlib.blake2b(data, digest_size=16).digest())
+    hit = _patched_cache.get(key)
+    if hit is None:
+        hit = _patched_cache[key] = compile_bytes(data, filename)
+    return hit
 
 
 def pinned_code(data: bytes, filename: str):
@@ -297,9 +311,14 @@ def _walk(old, new, import_ctx, out):
 
 
 def diff_code(old_module_code, new_module_code) -> list[Change]:
-    """Changed pinned code objects, outermost first."""
+    """Changed pinned code objects, outermost first (memoised per pair)."""
+    key = (id(old_module_code), id(new_module_code))
+    hit = _diff_cache.get(key)
+    if hit is not None and hit[0] is old_module_code and hit[1] is new_module_code:
+        return list(hit[2])
     out: list[Change] = []
     _walk(old_module_code, new_module_code, True, out)
+    _diff_cache[key] = (old_module_code, new_module_code, tuple(out))
     return out
 
 

@@ -176,7 +176,7 @@ class StaticSelector:
         except SyntaxError:
             return res.widen(f"pinned {path} does not compile here")
         try:
-            new_code = codediff.compile_bytes(new, full)
+            new_code = codediff.patched_code(new, full)
         except (SyntaxError, ValueError) as exc:
             return res.widen(f"patched {path} does not compile: {exc!r}")
         changes = codediff.diff_code(old_code, new_code)

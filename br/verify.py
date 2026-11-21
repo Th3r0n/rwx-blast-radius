@@ -275,7 +275,7 @@ def _activate(warm: Warm, job: Job):
     for path, (old, new) in job.py_files.items():
         full = os.path.join(ROOT, path)
         old_code = codediff.pinned_code(old, full)
-        new_code = codediff.compile_bytes(new, full)
+        new_code = codediff.patched_code(new, full)
         redirect[full] = new  # readers of the source as data
         name = module_name(path)
         if name not in sys.modules:
@@ -599,7 +599,7 @@ def _clean_child(tests_rows, job, pristine, choose, w):
     redirect = {os.path.join(ROOT, p): data for p, data in job.data_files.items()}
     for path, (old, new) in job.py_files.items():
         full = os.path.join(ROOT, path)
-        modules[module_name(path)] = (path, codediff.compile_bytes(new, full))
+        modules[module_name(path)] = (path, codediff.patched_code(new, full))
         redirect[full] = new
     finder = _PatchedFinder(modules)
     sys.meta_path.insert(0, finder)
@@ -842,7 +842,7 @@ def _lazy_child(job, pristine_full, w):
     redirect = {os.path.join(ROOT, p): data for p, data in job.data_files.items()}
     for path, (old, new) in job.py_files.items():
         full = os.path.join(ROOT, path)
-        modules[module_name(path)] = (path, codediff.compile_bytes(new, full))
+        modules[module_name(path)] = (path, codediff.patched_code(new, full))
         redirect[full] = new
     finder = _PatchedFinder(modules)
     sys.meta_path.insert(0, finder)
