@@ -117,3 +117,15 @@ The verifier runs such a test with the working directory set to an overlay tree 
 symlinks to the pinned tree everywhere else, so the subprocess imports the patched
 code. Checked with a canary (an extra dialect import in sqlglot/__init__.py makes the
 test fail in the overlay and pass without the patch).
+
+## TPC-DS front proof under import-time changes
+When test_execute_tpcds is a reader of changed import-time state, the clean child
+may still prove it: lab/trace/tpcds_rest_reads.py recorded, at the pinned commit,
+every class attribute, dict key and whole dict the test reads outside its front
+phase, the names its rest-phase code uses and that code's objects
+(maps/tpcds_rest.marshal). If no changed cell is among them (unmeasured, new or
+MRO cells always count as read; a function cell counts when its pinned code runs in
+the rest phase), and runtime changes of the commit reach no query's rest coverage,
+then an unchanged optimized tree for every one of the 99 queries proves the test
+passes. Checked on 64 clean-mode labeled commits selecting the test (15 where it
+really fails): no miss.

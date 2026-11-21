@@ -94,6 +94,7 @@ class Job:
         self.slices = {}  # {test id: item indexes} for item-sliced tests
         self.front = {}  # {test id: (items, rest items)} for the TPC-DS front proof
         self.subproc_ids = set()  # tests that start a Python subprocess (run from an overlay)
+        self.tpcds = None  # clean mode: {"number", "rest", "runtime_rest_ok"} for the front proof
 
 
 def run_job(warm: Warm, job: Job):
@@ -381,7 +382,7 @@ def _collect(pid, r, job):
                 if "id" in msg:
                     verdicts[msg["id"]] = msg["outcome"]
                 else:
-                    for key in ("proof", "error", "keep", "cells", "served", "run", "funcs", "dicts", "subs"):
+                    for key in ("proof", "error", "keep", "cells", "served", "run", "funcs", "dicts", "subs", "tpcds_front"):
                         if key in msg:
                             info[key] = msg[key]
     finally:
@@ -539,6 +540,56 @@ def _function_cells(cells, job):
     return out
 
 
+def _tpcds_rest_clear(cells, funcs, pristine, dicts_now, rest):
+    """True when no changed cell can reach test_execute_tpcds outside its front phase.
+
+    rest: what the test read outside the front at the pinned commit (lab/trace/
+    tpcds_rest_reads.py): measured attribute and key reads, names used by the
+    rest-phase code, and that code's objects. Unmeasured or new cells, MRO changes
+    and functions whose pinned code runs in the rest phase all answer False."""
+    pinned_funcs = pristine.get("funcs") or {}
+    measured = pristine.get("measured_set")
+    if measured is None:
+        measured = pristine["measured_set"] = set(map(tuple, pristine.get("measured") or ()))
+    pinned_cells = pristine["cells"]
+    pinned_dicts = pristine.get("dict_attrs")
+    if pinned_dicts is None:
+        pinned_dicts = pristine["dict_attrs"] = {(c[1], c[2]) for c in pinned_cells if c[0] == "ck"}
+    for cell in cells:
+        kind = cell[0]
+        if kind == "mro" or cell not in pinned_cells:
+            return False
+        if cell in pinned_funcs or cell in funcs:
+            for table in (pinned_funcs, funcs):
+                if cell in table:
+                    where = table[cell]
+                    if where is None:
+                        return False
+                    path, qual, line = where
+                    if (qual, line) in rest["codes"].get(path, ()):
+                        return False
+            continue
+        if kind in ("g", "gk"):
+            if cell[2] in rest["names"]:
+                return False
+            continue
+        if kind == "ck":
+            if (cell[1], cell[2], cell[3]) in rest["keys"] or (cell[1], cell[2]) in rest["allkeys"]:
+                return False
+            continue
+        if kind != "c":
+            return False
+        if cell in dicts_now and (cell[1], cell[2]) in pinned_dicts:
+            if (cell[1], cell[2]) in rest["allkeys"]:
+                return False
+            continue  # its key cells are checked one by one
+        if cell not in measured:
+            return False
+        if (cell[1], cell[2]) in rest["reads"]:
+            return False
+    return True
+
+
 def _clean_child(tests_rows, job, pristine, choose, w):
     from . import statediff
 
@@ -583,6 +634,23 @@ def _clean_child(tests_rows, job, pristine, choose, w):
 
     subs_map = {c[1]: (sorted(_subclass_ids(c[1])) if _subclass_ids(c[1]) is not None else None) for c in cells if c[0] == "c"}
     to_run, to_keep = choose(cells, import_errors, funcs, dicts_now, subs_map)
+    tp = getattr(job, "tpcds", None)
+    front_note = None
+    if tp and tp["number"] in to_keep and not import_errors:
+        # test_execute_tpcds is a reader of the changed state. If nothing it reads
+        # outside its front phase changed, an unchanged optimized tree for every
+        # query proves it passes (br/slices.py front proof, here over all queries).
+        from . import slices as slmod
+
+        if tp["runtime_rest_ok"] and _tpcds_rest_clear(cells, funcs, pristine, dicts_now, tp["rest"]):
+            pristine_front = slmod.load_front()
+            if pristine_front is not None:
+                equal, differing, _unchecked = slmod.front_until_differ(range(pristine_front["n"]), pristine_front)
+                front_note = {"equal": len(equal), "differing": differing}
+                if differing is None and len(equal) == pristine_front["n"]:
+                    to_keep = [n for n in to_keep if n != tp["number"]]
+        else:
+            front_note = "rest reads changed state"
     report = {
         "cells": [list(c) for c in cells[:5000]],
         "keep": sorted(to_keep),
@@ -590,6 +658,7 @@ def _clean_child(tests_rows, job, pristine, choose, w):
         "funcs": {repr(k): v for k, v in list(funcs.items())[:500]},
         "dicts": [list(c) for c in sorted(dicts_now)][:500],
         "subs": subs_map,
+        "tpcds_front": front_note,
     }
     os.write(w, (json.dumps(report) + "\n").encode())
     from . import inlinepool

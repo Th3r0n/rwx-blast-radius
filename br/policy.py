@@ -44,6 +44,37 @@ def _cost(numbers, ms):
     return pack.pack([(n, ms[n]) for n in numbers])[0]
 
 
+def _best_prefix(chosen, runnable, ms, factor):
+    """(net saving ms, prefix length, cpu s) of the best plan "verify the first k of
+    runnable" (sorted by CPU per selected millisecond), (0, 0, 0.0) if none pays.
+    Prefixes of every size up to 24, then geometrically spaced sizes (packing is the
+    costly part), always including the full set."""
+    base = _cost(chosen, ms)
+    best = (0, 0, 0.0)
+    if not runnable:
+        return best
+    sizes = set(range(1, min(len(runnable), 24) + 1))
+    k = 24
+    while k < len(runnable):
+        k = int(k * 1.3) + 1
+        sizes.add(min(k, len(runnable)))
+    sizes.add(len(runnable))
+    cum = []
+    total = 0.0
+    for c, _n in runnable:
+        total += c * factor
+        cum.append(total)
+    for k in sorted(sizes):
+        removed = {x for _, x in runnable[:k]}
+        rest = [m for m in chosen if m not in removed]
+        gain = base - _cost(rest, ms)
+        cpu = cum[k - 1]
+        net = SAFETY * gain - cpu * 1000
+        if net > best[0]:
+            best = (net, k, cpu)
+    return best
+
+
 def _hot_eligible(res, maps):
     if res.all or getattr(res, "deleted", False):
         return False  # the verifier cannot make a pinned file disappear
@@ -141,31 +172,9 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
         # Verify the prefix (cheapest per selected millisecond first) with the best
         # expected saving if everything passes.
         runnable.sort(key=lambda cn: (cn[0] / max(ms[cn[1]], 1), cn[1]))
-        base = _cost(chosen, ms)
-        best = (0, 0, 0.0)
-        # Evaluate prefixes of every size up to 24, then geometrically spaced sizes
-        # (packing is the costly part), always including the full set.
-        sizes = set(range(1, min(len(runnable), 24) + 1))
-        k = 24
-        while k < len(runnable):
-            k = int(k * 1.3) + 1
-            sizes.add(min(k, len(runnable)))
-        sizes.add(len(runnable))
-        cum = []
-        total = 0.0
-        for c, _n in runnable:
-            total += c * factor
-            cum.append(total)
-        for k in sorted(sizes):
-            removed = {x for _, x in runnable[:k]}
-            rest = [m for m in chosen if m not in removed]
-            gain = base - _cost(rest, ms)
-            cpu = cum[k - 1]
-            net = SAFETY * gain - cpu * 1000
-            if net > best[0]:
-                best = (net, k, cpu)
+        best = _best_prefix(chosen, runnable, ms, factor)
         if not best[1]:
-            log(cid, f"not verified: best plan does not pay (base {base / 1000:.2f}s)")
+            log(cid, "not verified: best plan does not pay")
             continue
         run = [n for _, n in runnable[: best[1]]]
         keep_all = [n for n in chosen if n not in set(run)]
@@ -431,6 +440,24 @@ def cell_readers(
     return bits
 
 
+def _load_tpcds_rest(maps_dir):
+    import marshal
+
+    path = os.path.join(maps_dir, "tpcds_rest.marshal")
+    try:
+        with open(path, "rb") as f:
+            raw = marshal.load(f)
+    except OSError:
+        return None
+    return {
+        "reads": set(map(tuple, raw["reads"])),
+        "keys": set(map(tuple, raw["keys"])),
+        "allkeys": set(map(tuple, raw["allkeys"])),
+        "names": set(raw["names"]),
+        "codes": {p: set(map(tuple, v)) for p, v in raw["codes"].items()},
+    }
+
+
 def _preload_third_party():
     """Import the third-party packages the test modules import (sqlglot uses none of
     them), so every clean child forked from here inherits them instead of paying for
@@ -466,6 +493,13 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
     attrs = _load_attrs(maps_dir)
     pinned_dicts = dict_attrs(pristine["cells"])
     _preload_third_party()
+    tpcds_rest = _load_tpcds_rest(maps_dir)
+    tpcds_number = number_of.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+    if tpcds_rest is not None:
+        from . import slices as slmod
+
+        slmod.load_default()  # shared with the children
+        slmod.load_front()
     factor = float(os.environ.get("BR_CPU_FACTOR", "2.5"))
     rows = {t["number"]: t for t in tests}
     bit_numbers = [number_of.get(test_id) for test_id in maps.tests]
@@ -521,23 +555,40 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
                     chosen.add(bit_numbers[k])
                 bits >>= 1
                 k += 1
-            light = sorted(n for n in chosen if n not in never)
-            keep = sorted(n for n in chosen if n in never)
-            gain = _cost(sorted(chosen), ms) - _cost(keep, ms)
-            cpu = sum(est.get(n, ms[n] / 1000.0) for n in light) * factor * EST_PLAIN
-            if not light or cpu * 1000 > SAFETY * gain:
-                return [], sorted(chosen)
-            return [rows[n] for n in light], keep
+            chosen = sorted(chosen)
+            runnable = sorted(
+                ((est.get(n, ms[n] / 1000.0) * EST_PLAIN, n) for n in chosen if n not in never),
+                key=lambda cn: (cn[0] / max(ms[cn[1]], 1), cn[1]),
+            )
+            net, k, _cpu = _best_prefix(chosen, runnable, ms, factor)
+            if not k:
+                return [], chosen
+            run = {n for _, n in runnable[:k]}
+            return [rows[n] for n in chosen if n in run], [n for n in chosen if n not in run]
 
         job = verify.Job(
             cid,
             [],
             dict(res.py_files),
             {path: new for path, _old, new in res.data_changes},
-            cpu_limit=30.0,
-            wall_limit=40.0,
+            cpu_limit=45.0,
+            wall_limit=60.0,
         )
         job.subproc_ids = subproc_ids
+        if tpcds_rest is not None and tpcds_number is not None:
+            # Runtime (function) changes of the same commit must not reach the
+            # rest phase of any query either.
+            from . import slices as slmod
+
+            runtime = [(p, c) for p, c in res.changes if not c.import_time and c.kind == "function"]
+            rest_ok = True
+            if runtime:
+                smap = slmod.load_default()
+                _items, rest_items = slmod.affected_split(smap, slmod.TPCDS_TEST, runtime, res.data_changes)
+                rest_ok = rest_items is not None and not rest_items
+            elif res.data_changes:
+                rest_ok = not any(p.startswith("tests/fixtures/optimizer/tpc-ds") for p, _o, _n in res.data_changes)
+            job.tpcds = {"number": tpcds_number, "rest": tpcds_rest, "runtime_rest_ok": rest_ok}
         t0 = time.monotonic()
         verdicts, info = verify.run_clean_job(tests, job, pristine, choose)
         keep = info.get("keep")
@@ -551,6 +602,7 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
         log(
             cid,
             f"clean: {info.get('proof', {}).get('cells')} changed cells, kept {len(keep)}, ran {len(ran)},"
+            f" tpcds front {info.get('tpcds_front')},"
             f" {len(failing)} fail; child cpu {info.get('cpu', 0):.2f}s wall {time.monotonic() - t0:.2f}s;"
             f" cells {str(info.get('cells'))[:300]}",
         )
