@@ -109,3 +109,11 @@ The check stops at the first query whose tree differs or raises (the test is the
 kept, unverified), and remaining queries run only when their estimated cost fits
 in the expected saving. Validated on 212 labeled or reference-checked pairs with no
 false pass; every query it skipped was re-run alone and passed.
+
+## Tests that start a Python subprocess
+`test_lazy_load` runs `python -c "import sqlglot; ..."` from the working directory.
+The verifier runs such a test with the working directory set to an overlay tree in
+/tmp: real directories along the patched paths, the patched files written there,
+symlinks to the pinned tree everywhere else, so the subprocess imports the patched
+code. Checked with a canary (an extra dialect import in sqlglot/__init__.py makes the
+test fail in the overlay and pass without the patch).

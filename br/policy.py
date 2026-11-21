@@ -19,6 +19,9 @@ import time
 from . import pack, verify
 
 HEAVY_MS = 1000
+# Tests that start a Python subprocess (test_lazy_load) run from an overlay tree
+# with the patch applied, so they can be verified too.
+SUBPROC_VERIFY = os.environ.get("BR_SUBPROC_VERIFY", "1") == "1"
 # Never run in a verification child: 46 CPU-s and 1.7 GB (test_max_nodes); the
 # TPC-DS executor test goes through its front proof only.
 NEVER_RUN = frozenset(
@@ -63,11 +66,14 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
         if n is not None and cpu_list:
             est[n] = cpu_list[i]
     never = set()
+    subproc_ids = set()
     bits = maps.subprocs
     i = 0
     while bits:
         if bits & 1 and bit_numbers[i] is not None:
-            never.add(bit_numbers[i])
+            subproc_ids.add(maps.tests[i])
+            if not SUBPROC_VERIFY:
+                never.add(bit_numbers[i])
         bits >>= 1
         i += 1
     for t in tests:
@@ -192,6 +198,7 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
             wall_limit=max(10.0, cpu / factor * 6 + 5),
         )
         job.slices = sliced
+        job.subproc_ids = subproc_ids
         job.front = {tid: (items, rest) for tid, (items, rest, _w) in fronts.items()}
         if fronts:
             # Items may run only within what verifying the rest of the job leaves of
@@ -471,10 +478,13 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
     for t in tests:
         if t["id"] in NEVER_RUN:
             never.add(t["number"])
+    subproc_ids = set()
     b, i = maps.subprocs, 0
     while b:
         if b & 1 and bit_numbers[i] is not None:
-            never.add(bit_numbers[i])
+            subproc_ids.add(maps.tests[i])
+            if not SUBPROC_VERIFY:
+                never.add(bit_numbers[i])
         b >>= 1
         i += 1
     every = sorted(ms)
@@ -527,6 +537,7 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
             cpu_limit=30.0,
             wall_limit=40.0,
         )
+        job.subproc_ids = subproc_ids
         t0 = time.monotonic()
         verdicts, info = verify.run_clean_job(tests, job, pristine, choose)
         keep = info.get("keep")

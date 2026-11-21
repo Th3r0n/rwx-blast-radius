@@ -119,9 +119,12 @@ class Describer:
                         continue
                     if hasattr(value, slot):
                         state.append((slot, self(getattr(value, slot), depth)))
-            if state or not _has_address_repr(value):
-                return ("obj", type(value).__module__, type(value).__qualname__, tuple(state),
-                        None if _has_address_repr(value) else repr(value))
+            if state:
+                # The instance state describes it; its repr adds nothing (and can be
+                # costly: sqlglot expressions render their whole tree).
+                return ("obj", type(value).__module__, type(value).__qualname__, tuple(state), None)
+            if not _has_address_repr(value):
+                return ("obj", type(value).__module__, type(value).__qualname__, (), repr(value))
         try:
             r = repr(value)
         except Exception:
@@ -165,8 +168,9 @@ class Describer:
 
 def _has_address_repr(value) -> bool:
     try:
-        r = object.__repr__(value)
-        return type(value).__repr__ is object.__repr__ or " at 0x" in repr(value)
+        if type(value).__repr__ is object.__repr__:
+            return True
+        return " at 0x" in repr(value)
     except Exception:
         return True
 

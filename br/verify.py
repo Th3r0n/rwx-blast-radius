@@ -93,6 +93,7 @@ class Job:
         self.stop_on_fail = stop_on_fail
         self.slices = {}  # {test id: item indexes} for item-sliced tests
         self.front = {}  # {test id: (items, rest items)} for the TPC-DS front proof
+        self.subproc_ids = set()  # tests that start a Python subprocess (run from an overlay)
 
 
 def run_job(warm: Warm, job: Job):
@@ -396,6 +397,66 @@ def _collect(pid, r, job):
     return verdicts, info
 
 
+def _build_overlay(job):
+    """A tree that looks like ROOT with the patch applied, for tests that start a
+    Python subprocess (it imports sqlglot from its working directory): real
+    directories along the patched paths, symlinks to the pinned tree elsewhere."""
+    import tempfile
+
+    files = {}
+    for path, (_old, new) in job.py_files.items():
+        files[path] = new
+    for path, new in job.data_files.items():
+        files[path] = new
+    root = tempfile.mkdtemp(prefix="br-ovl-", dir="/tmp")
+    needed = set()
+    for path in files:
+        parts = path.split("/")
+        for k in range(1, len(parts)):
+            needed.add("/".join(parts[:k]))
+
+    def mirror(rel):
+        src = os.path.join(ROOT, rel) if rel else ROOT
+        dst = os.path.join(root, rel) if rel else root
+        os.makedirs(dst, exist_ok=True)
+        for name in os.listdir(src):
+            r = f"{rel}/{name}" if rel else name
+            if r in needed:
+                mirror(r)
+            elif r in files:
+                pass  # written below
+            else:
+                os.symlink(os.path.join(src, name), os.path.join(dst, name))
+
+    mirror("")
+    for path, data in files.items():
+        if data is None:
+            continue
+        full = os.path.join(root, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(data)
+    return root
+
+
+def _subprocess_hooks(job, tests):
+    """before_test/after_test hooks that run subprocess tests from the overlay."""
+    ids = getattr(job, "subproc_ids", None) or set()
+    if not ids or not any(r["id"] in ids for r in tests):
+        return None, None
+    overlay = _build_overlay(job)
+
+    def before(entry):
+        if entry["id"] in ids:
+            os.chdir(overlay)
+
+    def after(entry, verdict):
+        if entry["id"] in ids:
+            os.chdir(ROOT)
+
+    return before, after
+
+
 def _limits(job):
     try:
         import resource
@@ -545,7 +606,8 @@ def _clean_child(tests_rows, job, pristine, choose, w):
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     if to_run:
-        unitrun.run_tests(to_run, root=ROOT, warm=state, on_verdict=on_verdict)
+        before, after = _subprocess_hooks(job, to_run)
+        unitrun.run_tests(to_run, root=ROOT, warm=state, on_verdict=on_verdict, before_test=before, after_test=after)
 
 
 def _child(warm: Warm, job: Job, w: int):
@@ -615,7 +677,10 @@ def _child(warm: Warm, job: Job, w: int):
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)  # tests must never write to the real stdout
     try:
-        unitrun.run_tests(job.tests, root=ROOT, warm=warm.state, on_verdict=on_verdict)
+        before, after = _subprocess_hooks(job, job.tests)
+        unitrun.run_tests(
+            job.tests, root=ROOT, warm=warm.state, on_verdict=on_verdict, before_test=before, after_test=after
+        )
     except _Stop:
         pass
     if finder is not None:
