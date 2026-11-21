@@ -19,6 +19,14 @@ import time
 from . import pack, verify
 
 HEAVY_MS = 1000
+# Never run in a verification child: 46 CPU-s and 1.7 GB (test_max_nodes); the
+# TPC-DS executor test goes through its front proof only.
+NEVER_RUN = frozenset(
+    {
+        "tests/test_parser.py::TestParser::test_max_nodes",
+        "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    }
+)
 # Measured child CPU / estimate on 40-commit batches of labeled mutants (median):
 # isolated-run calibration over-counts shared class setup and lazy imports.
 EST_PLAIN = 0.65
@@ -63,7 +71,7 @@ def refine(answers, statics, tests, ms, maps, number_of, deadline, log):
         bits >>= 1
         i += 1
     for t in tests:
-        if t["file"] == "tests/test_executor.py" or ms[t["number"]] >= HEAVY_MS:
+        if t["id"] in NEVER_RUN:
             never.add(t["number"])
 
     from . import slices as slmod
@@ -461,7 +469,7 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
                 est[n] = maps.cpu[i]
     never = set()
     for t in tests:
-        if t["file"] == "tests/test_executor.py" or ms[t["number"]] >= HEAVY_MS:
+        if t["id"] in NEVER_RUN:
             never.add(t["number"])
     b, i = maps.subprocs, 0
     while b:
@@ -506,7 +514,7 @@ def refine_clean(answers, statics, tests, ms, maps, number_of, deadline, log, ma
             light = sorted(n for n in chosen if n not in never)
             keep = sorted(n for n in chosen if n in never)
             gain = _cost(sorted(chosen), ms) - _cost(keep, ms)
-            cpu = sum(est.get(n, ms[n] / 1000.0) for n in light) * factor
+            cpu = sum(est.get(n, ms[n] / 1000.0) for n in light) * factor * EST_PLAIN
             if not light or cpu * 1000 > SAFETY * gain:
                 return [], sorted(chosen)
             return [rows[n] for n in light], keep

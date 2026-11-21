@@ -534,6 +534,9 @@ def _clean_child(tests_rows, job, pristine, choose, w):
     from . import inlinepool
 
     inlinepool.install([m for n, m in list(sys.modules.items()) if n.startswith("tests") and m is not None])
+    from . import slices as slmod
+
+    slmod.duckdb_single_thread()  # stay far below the container's thread limit
     os.write(w, (json.dumps({"proof": {"served": touched, "cells": len(cells)}}) + "\n").encode())
 
     def on_verdict(v):
