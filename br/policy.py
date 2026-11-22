@@ -37,7 +37,7 @@ NEVER_RUN = frozenset(
 EST_PLAIN = 0.65
 EST_SLICED = 0.5
 EST_FRONT = 0.3
-SAFETY = 0.7  # verify only when CPU estimate <= SAFETY * gain
+SAFETY = float(os.environ.get("BR_SAFETY", "0.7"))  # verify only when CPU estimate <= SAFETY * gain
 
 
 def _cost(numbers, ms):

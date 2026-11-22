@@ -14,3 +14,16 @@ Labeled-mutant validation of submit-10 (40-commit batches, like the board):
 - dev corpus (dev1, ood1, targeted1, state1; 620 commits): 0 misses, simulated 4695.0 s
   (oracle 2026.6 s).
 - holdout1 (never used for tuning; 151 labeled so far): 0 misses.
+
+## Verification threshold sweep (2026-11-22)
+Local, scorer's docker flags, cgroup CPU of the whole container. Totals = simulated + CPU.
+
+| BR_CPU_FACTOR / BR_SAFETY | dev (620) | holdout (193) | sample (30) |
+|---|---|---|---|
+| 1.5 / 0.7 (previous) | 4573.1 + 310.2 = 4883.4 | 1061.2 + 70.8 = 1132.0 | 129.386 + 6.8 = 136.2 |
+| 1.0 / 1.0 | 4408.7 + 399.6 = 4808.3 | | 127.315 + 9.9 = 137.2 |
+| 0.85 / 1.0 (chosen) | 4386.2 + 393.5 = 4779.7 | 1005.8 + 102.8 = 1108.6 | 127.315 + 10.0 = 137.4 |
+| 0.7 / 1.0 | 4308.7 + 456.3 = 4764.9 | 1003.7 + 116.5 = 1120.1 | 127.315 + 10.4 = 137.7 |
+| 0.5 / 1.0 | 4093.6 + 642.9 = 4736.4 | | |
+
+0 misses everywhere. 0.85 keeps most of the gain if the scoring machine charges more CPU than ours.
