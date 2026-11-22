@@ -1,12 +1,3 @@
-kit/
-ref/
-lab/out/
-lab/corpus/
-output*.jsonl
+output.jsonl
 __pycache__/
 *.pyc
-.claude/
-lab/data/*
-lab/notes/
-lab/scratch/
-!lab/data/collection_modules.json
